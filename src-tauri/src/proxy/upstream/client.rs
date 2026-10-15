@@ -571,7 +571,19 @@ impl UpstreamClient {
                     } else {
                         crate::proxy::image_attempt_budget::reserve_current_profile_attempt().await
                     };
-                    reservation.map_err(|error| error.to_string())?;
+                    let attempt = reservation.map_err(|error| error.to_string())?;
+                    let evidence_path = match attempt_budget_path.clone() {
+                        Some(path) => path,
+                        None => crate::proxy::image_attempt_budget::current_profile_budget_path()
+                            .map_err(|error| error.to_string())?,
+                    };
+                    crate::proxy::image_attempt_budget::record_attempt_evidence_at(
+                        &evidence_path,
+                        attempt,
+                        &url,
+                        &body,
+                    )
+                    .map_err(|error| error.to_string())?;
                 }
 
                 let response = req_builder.send().await;

@@ -54,6 +54,8 @@ jobs:
       - name: Run persistent-budget tests with localhost mock upstreams
         shell: pwsh
         run: |
+          python -m unittest discover -s tests -p test_native_image_resolution_mock.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $manifest = 'src-tauri/Cargo.toml'
           cargo test --locked --manifest-path $manifest --lib --features native-image-live-test proxy::image_attempt_budget::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

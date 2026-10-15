@@ -36,6 +36,13 @@ impl std::error::Error for ReserveAttemptError {}
 /// Reserve one upstream image-generation attempt in the current isolated profile.
 /// The durable SQLite row is shared across requests and process restarts.
 pub async fn reserve_current_profile_attempt() -> Result<u64, ReserveAttemptError> {
+    let path = current_profile_budget_path()?;
+    tokio::task::spawn_blocking(move || reserve_attempt_at(&path))
+        .await
+        .map_err(|error| ReserveAttemptError::Storage(format!("worker failed: {error}")))?
+}
+
+pub fn current_profile_budget_path() -> Result<PathBuf, ReserveAttemptError> {
     let configured_profile = std::env::var("ABV_DATA_DIR").ok();
     if configured_profile
         .as_deref()
@@ -47,12 +54,49 @@ pub async fn reserve_current_profile_attempt() -> Result<u64, ReserveAttemptErro
             "ABV_DATA_DIR must explicitly select the isolated live-test profile".to_string(),
         ));
     }
-    let path = crate::modules::account::get_data_dir()
+    Ok(crate::modules::account::get_data_dir()
         .map_err(ReserveAttemptError::Storage)?
-        .join(DB_FILE);
-    tokio::task::spawn_blocking(move || reserve_attempt_at(&path))
-        .await
-        .map_err(|error| ReserveAttemptError::Storage(format!("worker failed: {error}")))?
+        .join(DB_FILE))
+}
+
+/// Store only allowlisted fields from the final upstream body, never auth headers,
+/// account/project identifiers, cookies, OAuth data, prompts or inline image data.
+pub fn record_attempt_evidence_at(
+    path: &Path,
+    attempt: u64,
+    endpoint: &str,
+    body: &serde_json::Value,
+) -> Result<(), ReserveAttemptError> {
+    use std::io::Write;
+    let evidence = serde_json::json!({
+        "reserved_attempt": attempt,
+        "timestamp_utc": chrono::Utc::now().to_rfc3339(),
+        "endpoint": endpoint,
+        "method": "generateContent",
+        "payload_allowlist": {
+            "model": body.get("model"),
+            "requestType": body.get("requestType"),
+            "request": {"generationConfig": {
+                "candidateCount": body.pointer("/request/generationConfig/candidateCount"),
+                "imageConfig": {
+                    "imageSize": body.pointer("/request/generationConfig/imageConfig/imageSize"),
+                    "aspectRatio": body.pointer("/request/generationConfig/imageConfig/aspectRatio")
+                }
+            }}
+        },
+        "omitted": "All non-allowlisted body fields and all HTTP headers",
+        "stage": "reserved_before_send; does not prove Google accepted the request"
+    });
+    let bytes = serde_json::to_vec_pretty(&evidence)
+        .map_err(|error| ReserveAttemptError::Storage(error.to_string()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path.with_extension(format!("attempt-{attempt}.json")))
+        .map_err(|error| ReserveAttemptError::Storage(error.to_string()))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| ReserveAttemptError::Storage(error.to_string()))
 }
 
 /// Atomically reserve a slot at a specified database path.
@@ -165,6 +209,56 @@ mod tests {
         );
         assert_eq!(current_usage_at(&path).unwrap(), 5);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn actual_child_processes_share_the_same_budget() {
+        const CHILD_PATH: &str = "NATIVE_IMAGE_MOCK_CHILD_BUDGET";
+        if let Ok(path) = std::env::var(CHILD_PATH) {
+            let expected: u64 = std::env::var("NATIVE_IMAGE_MOCK_CHILD_ATTEMPT")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let result = reserve_attempt_at(Path::new(&path));
+            if expected <= 5 {
+                assert_eq!(result.unwrap(), expected);
+            } else {
+                assert_eq!(result, Err(ReserveAttemptError::Exhausted { limit: 5 }));
+            }
+            return;
+        }
+        let path = fresh_db_path("child-process");
+        for attempt in 1..=6 {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "proxy::image_attempt_budget::tests::actual_child_processes_share_the_same_budget"])
+                .env(CHILD_PATH, &path)
+                .env("NATIVE_IMAGE_MOCK_CHILD_ATTEMPT", attempt.to_string())
+                .status().unwrap();
+            assert!(status.success());
+        }
+        assert_eq!(current_usage_at(&path).unwrap(), 5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn evidence_excludes_secrets_and_refuses_overwrite() {
+        let path = fresh_db_path("evidence");
+        let body = serde_json::json!({
+            "project": "sensitive-project", "model": "mock-image", "requestType": "image_gen",
+            "request": {"contents": [{"text": "private-prompt"}], "generationConfig": {
+                "candidateCount": 1, "api_key": "never-write-me",
+                "imageConfig": {"imageSize": "4K", "aspectRatio": "1:1", "token": "never-write-me"}
+            }}
+        });
+        record_attempt_evidence_at(&path, 1, "http://127.0.0.1/mock", &body).unwrap();
+        let evidence_path = path.with_extension("attempt-1.json");
+        let text = std::fs::read_to_string(&evidence_path).unwrap();
+        assert!(text.contains("4K"));
+        for secret in ["sensitive-project", "private-prompt", "never-write-me"] {
+            assert!(!text.contains(secret));
+        }
+        assert!(record_attempt_evidence_at(&path, 1, "http://127.0.0.1/mock", &body).is_err());
+        let _ = std::fs::remove_file(evidence_path);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
