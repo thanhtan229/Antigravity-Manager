@@ -17,6 +17,7 @@ pub mod droid_sync; // Droid (Factory CLI) 配置同步
 pub mod handlers; // API 端点处理器
 pub mod hermes_sync; // Hermes Agent 配置同步
 pub mod http_session_store; // HTTP多轮对话会话历史存储
+pub mod image_attempt_budget; // Persistent hard cap for isolated native-image live-test builds
 pub mod mappers; // 协议转换器
 pub mod middleware; // Axum 中间件
 pub mod model_specs; // 模型规格管理 (v4.1.29)

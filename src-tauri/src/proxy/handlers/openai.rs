@@ -5145,6 +5145,18 @@ pub async fn handle_images_generations(
     }
 }
 
+fn image_generation_count_allowed_for_build(n: usize) -> bool {
+    !cfg!(feature = "native-image-live-test") || n == 1
+}
+
+fn image_generation_account_attempt_limit(pool_size: usize) -> usize {
+    if cfg!(feature = "native-image-live-test") {
+        1
+    } else {
+        crate::proxy::handlers::common::calculate_max_retry_attempts(pool_size)
+    }
+}
+
 pub async fn handle_images_generations_internal(
     state: AppState,
     headers: HeaderMap,
@@ -5172,6 +5184,14 @@ pub async fn handle_images_generations_internal(
         .unwrap_or("gemini-3.1-flash-image");
 
     let n = body.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    if !image_generation_count_allowed_for_build(n) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "The native-image live-test build accepts exactly one image per request (n=1)."
+                .to_string(),
+            None,
+        ));
+    }
 
     let size = body.get("size").and_then(|v| v.as_str());
 
@@ -5232,7 +5252,8 @@ pub async fn handle_images_generations_internal(
     let request_timeout = state.request_timeout;
     let max_pool_size = token_manager.len();
     // [FIX #3485] 自适应多账号池与单账号退避最大重试次数 (单账号3次，多账号整池两轮)
-    let max_attempts = crate::proxy::handlers::common::calculate_max_retry_attempts(max_pool_size);
+    // The dedicated live-test build never rotates accounts or retries an image request.
+    let max_attempts = image_generation_account_attempt_limit(max_pool_size);
 
     let mut tasks = JoinSet::new();
 
@@ -7628,4 +7649,20 @@ async fn try_compress_openai_with_summary(
     let mut forked_request = original_request.clone();
     forked_request.messages = forked_messages;
     Ok(forked_request)
+}
+
+#[cfg(all(test, feature = "native-image-live-test"))]
+mod native_image_live_test_count_tests {
+    use super::{image_generation_account_attempt_limit, image_generation_count_allowed_for_build};
+
+    #[test]
+    fn live_test_build_requires_exactly_one_image() {
+        assert!(image_generation_count_allowed_for_build(1));
+        assert!(!image_generation_count_allowed_for_build(0));
+        assert!(!image_generation_count_allowed_for_build(2));
+        assert!(!image_generation_count_allowed_for_build(5));
+        assert_eq!(image_generation_account_attempt_limit(0), 1);
+        assert_eq!(image_generation_account_attempt_limit(1), 1);
+        assert_eq!(image_generation_account_attempt_limit(20), 1);
+    }
 }

@@ -88,6 +88,7 @@ gtk = "0.18"
 
 [features]
 default = ["custom-protocol"]
+native-image-live-test = []
 custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]

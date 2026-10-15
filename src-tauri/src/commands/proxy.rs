@@ -274,8 +274,14 @@ pub async fn ensure_admin_server(
     // [NEW] 加载账号数据，否则管理界面统计为 0
     let _ = token_manager.load_accounts().await;
 
+    let bind_address = if cfg!(feature = "native-image-live-test") {
+        // The isolated live-test binary is loopback-only regardless of profile settings.
+        "127.0.0.1"
+    } else {
+        config.get_bind_address()
+    };
     let (axum_server, server_handle) = match crate::proxy::AxumServer::start(
-        config.get_bind_address().to_string(),
+        bind_address.to_string(),
         config.port,
         token_manager,
         config.custom_mapping.clone(),

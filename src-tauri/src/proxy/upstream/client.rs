@@ -94,11 +94,27 @@ pub struct UpstreamClient {
     user_agent_override: RwLock<Option<String>>,
 }
 
+fn configured_http2_retry_count() -> usize {
+    if cfg!(feature = "native-image-live-test") {
+        0
+    } else {
+        2 // rquest's normal default, retained for the production build.
+    }
+}
+
 impl UpstreamClient {
     pub fn new(
         proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>,
         proxy_pool: Option<Arc<crate::proxy::proxy_pool::ProxyPoolManager>>,
     ) -> Self {
+        // The test binary owns the attempt boundary. Do not route through a
+        // separately configured forwarding proxy that could retry POST requests
+        // outside this process's durable counter.
+        let (proxy_config, proxy_pool) = if cfg!(feature = "native-image-live-test") {
+            (None, None)
+        } else {
+            (proxy_config, proxy_pool)
+        };
         let default_client = match Self::build_client_internal(proxy_config.clone()) {
             Ok(client) => client,
             Err(err_with_proxy) => {
@@ -185,6 +201,18 @@ impl UpstreamClient {
             .tcp_keepalive(Duration::from_secs(60)) // TCP 稳态保活探测 (60秒)
             // 强制开启 HTTP/2 协议，并支持在 SOCKS/HTTPS 代理下通过 ALPN 强制降级/协商
             .timeout(Duration::from_secs(600));
+
+        // rquest otherwise permits hidden HTTP/2 retries (default: 2). The
+        // dedicated live-test binary disables them so one send() reservation
+        // cannot fan out into additional generateContent HTTP requests.
+        let builder = builder.http2_max_retry_count(configured_http2_retry_count());
+        let builder = if cfg!(feature = "native-image-live-test") {
+            // Redirect following can issue a second HTTP request invisibly inside
+            // one send(); keep redirects outside the image attempt boundary.
+            builder.redirect(rquest::redirect::Policy::none())
+        } else {
+            builder
+        };
 
         Self::apply_default_user_agent(builder)
     }
@@ -337,11 +365,51 @@ impl UpstreamClient {
         &self,
         method: &str,
         access_token: &str,
-        mut body: Value,
+        body: Value,
         query_string: Option<&str>,
         extra_headers: std::collections::HashMap<String, String>,
         account_id: Option<&str>, // [NEW] Account ID
     ) -> Result<UpstreamCallResult, String> {
+        self.call_v1_internal_with_headers_on_endpoints(
+            method,
+            access_token,
+            body,
+            query_string,
+            extra_headers,
+            account_id,
+            &V1_INTERNAL_BASE_URL_FALLBACKS,
+            None,
+        )
+        .await
+    }
+
+    async fn call_v1_internal_with_headers_on_endpoints(
+        &self,
+        method: &str,
+        access_token: &str,
+        mut body: Value,
+        query_string: Option<&str>,
+        extra_headers: std::collections::HashMap<String, String>,
+        account_id: Option<&str>,
+        endpoint_urls: &[&str],
+        attempt_budget_path: Option<std::path::PathBuf>,
+    ) -> Result<UpstreamCallResult, String> {
+        let is_live_test_image_generation = cfg!(feature = "native-image-live-test")
+            && method == "generateContent"
+            && body.get("requestType").and_then(Value::as_str) == Some("image_gen");
+
+        if is_live_test_image_generation && endpoint_urls.is_empty() {
+            return Err("No upstream endpoint configured; image request refused".to_string());
+        }
+
+        // The dedicated live-test build uses one endpoint only. It never falls back,
+        // including for network errors, 404s, timeouts, or 5xx responses.
+        let selected_endpoints: Vec<&str> = if is_live_test_image_generation {
+            endpoint_urls.iter().take(1).copied().collect()
+        } else {
+            endpoint_urls.to_vec()
+        };
+
         // [DEFENSE] 全局终极防御拦截：净化所有发往上游报文中的损坏/空 inlineData 以及触发 Google WAF 拦截的违规计费元数据，并最终统一对齐官方信封与前缀拓扑
         if let Some(inner) = body.get_mut("request") {
             crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(inner);
@@ -460,9 +528,9 @@ impl UpstreamClient {
             let mut should_retry_without_header = false;
 
             // 遍历所有端点，失败时自动切换
-            for (idx, base_url) in V1_INTERNAL_BASE_URL_FALLBACKS.iter().enumerate() {
+            for (idx, base_url) in selected_endpoints.iter().enumerate() {
                 let url = Self::build_url(base_url, method, query_string);
-                let has_next = idx + 1 < V1_INTERNAL_BASE_URL_FALLBACKS.len();
+                let has_next = idx + 1 < selected_endpoints.len();
 
                 let body_bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
 
@@ -480,6 +548,22 @@ impl UpstreamClient {
                     req_builder = req_builder.body(body_bytes.clone());
                 }
 
+                // Persist a reservation before every actual send. This deliberately
+                // counts requests that later fail at the socket/HTTP layer and closes
+                // races between callers and attempts across process restarts.
+                if is_live_test_image_generation {
+                    let reservation = if let Some(path) = attempt_budget_path.clone() {
+                        tokio::task::spawn_blocking(move || {
+                            crate::proxy::image_attempt_budget::reserve_attempt_at(&path)
+                        })
+                        .await
+                        .map_err(|error| format!("Image attempt budget worker failed: {error}"))?
+                    } else {
+                        crate::proxy::image_attempt_budget::reserve_current_profile_attempt().await
+                    };
+                    reservation.map_err(|error| error.to_string())?;
+                }
+
                 let response = req_builder.send().await;
 
                 match response {
@@ -491,7 +575,7 @@ impl UpstreamClient {
                                     "✓ Upstream fallback succeeded | Endpoint: {} | Status: {} | Next endpoints available: {}",
                                     base_url,
                                     status,
-                                    V1_INTERNAL_BASE_URL_FALLBACKS.len() - idx - 1
+                                    selected_endpoints.len() - idx - 1
                                 );
                             } else {
                                 tracing::debug!(
@@ -500,6 +584,15 @@ impl UpstreamClient {
                                     status
                                 );
                             }
+                            return Ok(UpstreamCallResult {
+                                response: resp,
+                                fallback_attempts,
+                            });
+                        }
+
+                        if is_live_test_image_generation {
+                            // The single network attempt has completed. Return its
+                            // response as-is so the image handler cannot rotate accounts.
                             return Ok(UpstreamCallResult {
                                 response: resp,
                                 fallback_attempts,
@@ -548,6 +641,9 @@ impl UpstreamClient {
                     Err(e) => {
                         let msg = format!("HTTP request failed at {}: {}", base_url, e);
                         tracing::debug!("{}", msg);
+                        if is_live_test_image_generation {
+                            return Err(msg);
+                        }
                         // [NEW] 记录网络错误的降级尝试
                         fallback_attempts.push(FallbackAttemptLog {
                             endpoint_url: url.clone(),
@@ -762,5 +858,297 @@ mod tests {
             url2,
             "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
         );
+    }
+}
+
+#[cfg(all(test, feature = "native-image-live-test"))]
+mod native_image_live_test_mock_tests {
+    use super::*;
+    use axum::{routing::any, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn feature_build_disables_rquests_hidden_http2_retries() {
+        assert_eq!(configured_http2_retry_count(), 0);
+    }
+
+    async fn start_mock_upstream() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let handler_hits = hits.clone();
+        let app = Router::new().fallback(any(move || {
+            let hits = handler_hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::INTERNAL_SERVER_ERROR, "mock upstream failure")
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            format!("http://{addr}/v1internal/models/mock"),
+            hits,
+            server,
+        )
+    }
+
+    fn image_generation_body() -> Value {
+        serde_json::json!({
+            "requestType": "image_gen",
+            "request": {
+                "contents": [],
+                "generationConfig": {"candidateCount": 1}
+            }
+        })
+    }
+
+    fn fresh_budget_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "native-image-mock-client-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[tokio::test]
+    async fn failed_mock_attempt_is_counted_and_does_not_fallback() {
+        let (first_url, first_hits, first_server) = start_mock_upstream().await;
+        let (fallback_url, fallback_hits, fallback_server) = start_mock_upstream().await;
+        let budget_path = fresh_budget_path();
+        let client = UpstreamClient::new(None, None);
+        let result = client
+            .call_v1_internal_with_headers_on_endpoints(
+                "generateContent",
+                "mock-only-token",
+                image_generation_body(),
+                None,
+                Default::default(),
+                None,
+                &[&first_url, &fallback_url],
+                Some(budget_path.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(result.fallback_attempts.is_empty());
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            crate::proxy::image_attempt_budget::current_usage_at(&budget_path).unwrap(),
+            1
+        );
+
+        first_server.abort();
+        fallback_server.abort();
+        let _ = std::fs::remove_file(budget_path);
+    }
+
+    #[tokio::test]
+    async fn network_failure_is_reserved_and_does_not_try_another_host() {
+        let (fallback_url, fallback_hits, fallback_server) = start_mock_upstream().await;
+        let dead_first_url = "http://127.0.0.1:1/v1internal/models/unreachable";
+        let budget_path = fresh_budget_path();
+        let client = UpstreamClient::new(None, None);
+        let result = client
+            .call_v1_internal_with_headers_on_endpoints(
+                "generateContent",
+                "mock-only-token",
+                image_generation_body(),
+                None,
+                Default::default(),
+                None,
+                &[dead_first_url, &fallback_url],
+                Some(budget_path.clone()),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            crate::proxy::image_attempt_budget::current_usage_at(&budget_path).unwrap(),
+            1
+        );
+
+        fallback_server.abort();
+        let _ = std::fs::remove_file(budget_path);
+    }
+
+    #[tokio::test]
+    async fn redirect_response_does_not_issue_a_hidden_second_request() {
+        let (redirect_target_url, target_hits, target_server) = start_mock_upstream().await;
+        let redirect_hits = Arc::new(AtomicUsize::new(0));
+        let handler_hits = redirect_hits.clone();
+        let redirect_app = Router::new().fallback(any(move || {
+            let hits = handler_hits.clone();
+            let target = redirect_target_url.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(axum::http::header::LOCATION, target)],
+                )
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_addr = listener.local_addr().unwrap();
+        let redirect_server = tokio::spawn(async move {
+            axum::serve(listener, redirect_app).await.unwrap();
+        });
+        let redirect_url = format!("http://{redirect_addr}/v1internal/models/redirect");
+        let budget_path = fresh_budget_path();
+        let client = UpstreamClient::new(None, None);
+        let result = client
+            .call_v1_internal_with_headers_on_endpoints(
+                "generateContent",
+                "mock-only-token",
+                image_generation_body(),
+                None,
+                Default::default(),
+                None,
+                &[&redirect_url],
+                Some(budget_path.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(redirect_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            crate::proxy::image_attempt_budget::current_usage_at(&budget_path).unwrap(),
+            1
+        );
+
+        redirect_server.abort();
+        target_server.abort();
+        let _ = std::fs::remove_file(budget_path);
+    }
+
+    #[tokio::test]
+    async fn repeated_requests_and_new_client_instances_share_the_five_attempt_cap() {
+        let (mock_url, hits, server) = start_mock_upstream().await;
+        let budget_path = fresh_budget_path();
+
+        // A fresh UpstreamClient per iteration models proxy process/client restarts.
+        for _ in 0..5 {
+            let client = UpstreamClient::new(None, None);
+            let result = client
+                .call_v1_internal_with_headers_on_endpoints(
+                    "generateContent",
+                    "mock-only-token",
+                    image_generation_body(),
+                    None,
+                    Default::default(),
+                    None,
+                    &[&mock_url],
+                    Some(budget_path.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        let sixth_client = UpstreamClient::new(None, None);
+        let sixth = sixth_client
+            .call_v1_internal_with_headers_on_endpoints(
+                "generateContent",
+                "mock-only-token",
+                image_generation_body(),
+                None,
+                Default::default(),
+                None,
+                &[&mock_url],
+                Some(budget_path.clone()),
+            )
+            .await;
+        assert!(sixth.err().unwrap().contains("attempt budget exhausted"));
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            crate::proxy::image_attempt_budget::current_usage_at(&budget_path).unwrap(),
+            5
+        );
+
+        server.abort();
+        let _ = std::fs::remove_file(budget_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_mock_requests_cannot_send_more_than_five_attempts() {
+        let (mock_url, hits, server) = start_mock_upstream().await;
+        let budget_path = fresh_budget_path();
+        let client = Arc::new(UpstreamClient::new(None, None));
+        let mut jobs = Vec::new();
+        for _ in 0..24 {
+            let client = client.clone();
+            let mock_url = mock_url.clone();
+            let budget_path = budget_path.clone();
+            jobs.push(tokio::spawn(async move {
+                client
+                    .call_v1_internal_with_headers_on_endpoints(
+                        "generateContent",
+                        "mock-only-token",
+                        image_generation_body(),
+                        None,
+                        Default::default(),
+                        None,
+                        &[&mock_url],
+                        Some(budget_path),
+                    )
+                    .await
+            }));
+        }
+
+        let mut sent = 0;
+        let mut rejected = 0;
+        for job in jobs {
+            match job.await.unwrap() {
+                Ok(response) => {
+                    assert_eq!(
+                        response.response.status(),
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    );
+                    sent += 1;
+                }
+                Err(message) if message.contains("attempt budget exhausted") => rejected += 1,
+                other => panic!("unexpected concurrent mock result: {other:?}"),
+            }
+        }
+        assert_eq!(sent, 5);
+        assert_eq!(rejected, 19);
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
+
+        server.abort();
+        let _ = std::fs::remove_file(budget_path);
+    }
+
+    #[tokio::test]
+    async fn non_image_generation_keeps_the_existing_endpoint_fallback_behavior() {
+        let (first_url, first_hits, first_server) = start_mock_upstream().await;
+        let (second_url, second_hits, second_server) = start_mock_upstream().await;
+        let client = UpstreamClient::new(None, None);
+        let result = client
+            .call_v1_internal_with_headers_on_endpoints(
+                "generateContent",
+                "mock-only-token",
+                serde_json::json!({"requestType": "code", "request": {"contents": []}}),
+                None,
+                Default::default(),
+                None,
+                &[&first_url, &second_url],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(result.fallback_attempts.len(), 1);
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+
+        first_server.abort();
+        second_server.abort();
     }
 }
