@@ -79,6 +79,13 @@ struct VersionConfig {
 /// Try to fetch the latest Antigravity version from the remote update server.
 /// Runs in a dedicated OS thread to avoid blocking Tokio's async runtime.
 /// Returns None on any network/parse failure — always non-fatal, 5s timeout.
+#[cfg(test)]
+fn try_fetch_remote_version() -> Option<String> {
+    // Unit tests must not contact a real Google updater/changelog service.
+    None
+}
+
+#[cfg(not(test))]
 fn try_fetch_remote_version() -> Option<String> {
     // Spawn a dedicated OS thread so that `reqwest::blocking` never touches
     // the Tokio thread-pool and cannot trigger the "Cannot block the current

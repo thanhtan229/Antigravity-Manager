@@ -41,6 +41,7 @@ jobs:
         shell: pwsh
         run: |
           $probeProgram = Join-Path $env:RUNNER_TEMP 'native-image-firewall-probe.exe'
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
           $rule = New-NetFirewallRule -DisplayName 'Native image test firewall validation' -Direction Outbound -Action Block -Program $probeProgram -RemoteAddress '1.0.0.0-126.255.255.255','128.0.0.0-223.255.255.255','2000::/3'
           Remove-NetFirewallRule -Name $rule.Name
 
