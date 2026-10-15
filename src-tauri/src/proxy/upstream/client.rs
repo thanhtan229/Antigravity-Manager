@@ -125,6 +125,9 @@ impl UpstreamClient {
                 match Self::build_client_internal(None) {
                     Ok(client) => client,
                     Err(err_without_proxy) => {
+                        if cfg!(feature = "native-image-live-test") {
+                            panic!("Safe live-test HTTP client unavailable; refusing an unbounded client: {err_without_proxy}");
+                        }
                         tracing::error!(
                             error = %err_without_proxy,
                             "Failed to create default HTTP client without proxy; falling back to bare client"
@@ -209,7 +212,9 @@ impl UpstreamClient {
         let builder = if cfg!(feature = "native-image-live-test") {
             // Redirect following can issue a second HTTP request invisibly inside
             // one send(); keep redirects outside the image attempt boundary.
-            builder.redirect(rquest::redirect::Policy::none())
+            builder
+                .no_proxy()
+                .redirect(rquest::redirect::Policy::none())
         } else {
             builder
         };
@@ -221,6 +226,11 @@ impl UpstreamClient {
     fn build_client_internal(
         proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>,
     ) -> Result<Client, rquest::Error> {
+        let proxy_config = if cfg!(feature = "native-image-live-test") {
+            None
+        } else {
+            proxy_config
+        };
         let mut builder = Self::base_client_builder();
 
         if let Some(config) = proxy_config {
@@ -1113,7 +1123,7 @@ mod native_image_live_test_mock_tests {
                     sent += 1;
                 }
                 Err(message) if message.contains("attempt budget exhausted") => rejected += 1,
-                other => panic!("unexpected concurrent mock result: {other:?}"),
+                Err(message) => panic!("unexpected concurrent mock error: {message}"),
             }
         }
         assert_eq!(sent, 5);
