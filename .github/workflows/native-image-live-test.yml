@@ -57,11 +57,26 @@ jobs:
           python -m unittest discover -s tests -p test_native_image_resolution_mock.py -v
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $manifest = 'src-tauri/Cargo.toml'
-          cargo test --locked --manifest-path $manifest --lib --features native-image-live-test proxy::image_attempt_budget::tests
+          $buildMessages = cargo test --locked --manifest-path $manifest --lib --features native-image-live-test --no-run --message-format=json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked --manifest-path $manifest --lib --features native-image-live-test proxy::upstream::client::native_image_live_test_mock_tests
+          $testExecutables = @($buildMessages | ForEach-Object {
+            $message = $_ | ConvertFrom-Json
+            if ($message.reason -eq 'compiler-artifact' -and $message.profile.test -and $message.target.name -eq 'antigravity_tools_lib' -and $message.executable) { $message.executable }
+          })
+          if ($testExecutables.Count -ne 1) { throw 'Expected one Rust lib test executable' }
+          $testExecutable = $testExecutables[0]
+          $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+          $manifestTool = Get-ChildItem "$sdkBin/*/x64/mt.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $manifestTool) { throw 'Windows SDK manifest tool not found' }
+          # Tauri embeds the normal application manifest only into app binaries.
+          # Apply Common Controls v6 to this test executable only (tauri#13419).
+          & $manifestTool.FullName -nologo -manifest tests/windows_test_common_controls.xml "-outputresource:$testExecutable;#1"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked --manifest-path $manifest --lib --features native-image-live-test proxy::handlers::openai::native_image_live_test_count_tests
+          & $testExecutable proxy::image_attempt_budget::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $testExecutable proxy::upstream::client::native_image_live_test_mock_tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $testExecutable proxy::handlers::openai::native_image_live_test_count_tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build the dedicated test binary
