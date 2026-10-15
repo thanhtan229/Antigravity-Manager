@@ -37,6 +37,20 @@ jobs:
       - name: Set up stable Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Download checksum-pinned NASM from the official distribution
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'nasm-3.02-win64.zip'
+          Invoke-WebRequest -Uri 'https://www.nasm.us/pub/nasm/releasebuilds/3.02/win64/nasm-3.02-win64.zip' -OutFile $archive
+          $expected = '161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7'
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'NASM checksum mismatch' }
+          $destination = Join-Path $env:RUNNER_TEMP 'native-image-build-tools'
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $nasmDirectory = Join-Path $destination 'nasm-3.02'
+          & (Join-Path $nasmDirectory 'nasm.exe') -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $nasmDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Run persistent-budget tests with localhost mock upstreams
         shell: pwsh
         run: |
