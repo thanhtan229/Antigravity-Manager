@@ -72,6 +72,10 @@ jobs:
           # Apply Common Controls v6 to this test executable only (tauri#13419).
           & $manifestTool.FullName -nologo -manifest tests/windows_test_common_controls.xml "-outputresource:$testExecutable;#1"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The application's User-Agent resolver can check Google's update service.
+          # Block all non-loopback traffic from the test executable (including children)
+          # so even ancillary code can never reach a real Google service in CI.
+          New-NetFirewallRule -DisplayName 'Native image tests: localhost only' -Direction Outbound -Action Block -Program $testExecutable -RemoteAddress '0.0.0.0-126.255.255.255','128.0.0.0-255.255.255.255','::/0' | Out-Null
           & $testExecutable proxy::image_attempt_budget::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $testExecutable proxy::upstream::client::native_image_live_test_mock_tests
