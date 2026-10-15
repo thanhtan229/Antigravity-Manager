@@ -1,6 +1,9 @@
 name: Native image live-test safety build
 
 on:
+  push:
+    branches:
+      - codex/native-4k-safe-test
   workflow_dispatch:
 
 permissions:
@@ -16,13 +19,34 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Node.js for the embedded UI assets
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Build the embedded UI assets
+        shell: pwsh
+        run: |
+          npm install --legacy-peer-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Set up stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Run persistent-budget tests with localhost mock upstreams
         shell: pwsh
         run: |
           $manifest = 'src-tauri/Cargo.toml'
           cargo test --locked --manifest-path $manifest --lib --features native-image-live-test proxy::image_attempt_budget::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --manifest-path $manifest --lib --features native-image-live-test proxy::upstream::client::native_image_live_test_mock_tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --manifest-path $manifest --lib --features native-image-live-test proxy::handlers::openai::native_image_live_test_count_tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build the dedicated test binary
         shell: pwsh
@@ -35,12 +59,15 @@ jobs:
           $output = Join-Path $env:RUNNER_TEMP 'native-image-live-test-artifact'
           New-Item -ItemType Directory -Force -Path $output | Out-Null
           Copy-Item -LiteralPath $binary -Destination (Join-Path $output 'antigravity-tools.exe')
+          Copy-Item -LiteralPath 'src-tauri/resources/WebView2Loader.dll' -Destination (Join-Path $output 'WebView2Loader.dll')
           $commit = (git rev-parse HEAD).Trim()
-          $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $output 'antigravity-tools.exe')).Hash.ToLowerInvariant()
+          $binarySha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $output 'antigravity-tools.exe')).Hash.ToLowerInvariant()
+          $loaderSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $output 'WebView2Loader.dll')).Hash.ToLowerInvariant()
           Set-Content -LiteralPath (Join-Path $output 'source-commit.txt') -Value $commit -NoNewline
-          Set-Content -LiteralPath (Join-Path $output 'sha256.txt') -Value "$sha256  antigravity-tools.exe" -NoNewline
+          Set-Content -LiteralPath (Join-Path $output 'sha256.txt') -Value "$binarySha256  antigravity-tools.exe`n$loaderSha256  WebView2Loader.dll" -NoNewline
           Write-Output "Source commit: $commit"
-          Write-Output "Binary SHA-256: $sha256"
+          Write-Output "Binary SHA-256: $binarySha256"
+          Write-Output "WebView2Loader SHA-256: $loaderSha256"
 
       - name: Upload only the binary and provenance files
         uses: actions/upload-artifact@v7
