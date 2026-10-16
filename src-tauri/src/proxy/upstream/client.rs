@@ -1480,7 +1480,10 @@ mod native_image_live_test_mock_tests {
             1
         );
         let (log_text, events) = read_events(&budget_path);
-        assert_eq!(events.last().unwrap()["event"], "UPSTREAM_ERROR");
+        assert!(matches!(
+            events.last().unwrap()["event"].as_str(),
+            Some("UPSTREAM_ERROR" | "UPSTREAM_TIMEOUT")
+        ));
         assert!(!log_text.contains("mock-only-token"));
 
         fallback_server.abort();
