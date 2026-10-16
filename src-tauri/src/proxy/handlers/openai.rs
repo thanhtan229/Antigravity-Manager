@@ -5339,6 +5339,21 @@ pub async fn handle_images_generations_internal(
                 }
             }
         }
+        if !state.token_manager.any_account_lists_exact_model(explicit_model) {
+            let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+                explicit_model,
+                "",
+                "account_missing_exact_model",
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "MODEL_UNAVAILABLE_ON_ACCOUNT: no active account in the isolated profile explicitly lists model '{}'.",
+                    explicit_model
+                ),
+                None,
+            ));
+        }
         explicit_model
     } else {
         body.get("model")

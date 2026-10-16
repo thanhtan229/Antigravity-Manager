@@ -119,8 +119,11 @@ def make_handler(mock_state: MockUpstreamState):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(payload)
+                self.wfile.flush()
+                self.close_connection = True
                 return
 
             status_code = int(mode)
@@ -138,8 +141,11 @@ def make_handler(mock_state: MockUpstreamState):
                 self.send_header("Retry-After", "1")
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(err_payload)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(err_payload)
+            self.wfile.flush()
+            self.close_connection = True
 
     return MockUpstreamHandler
 
@@ -300,13 +306,51 @@ def http_request(port: int, method: str, path: str, body=None, timeout=10.0):
         return err.code, parsed
 
 
-def wait_for_health(port: int, proc: subprocess.Popen, timeout_sec: float = 15.0):
+def read_log_file(path: Path) -> str:
+    if path and path.exists():
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+    return ""
+
+
+def spawn_proxy_process(binary_path: Path, profile_dir: Path, port: int, env: dict):
+    stdout_path = profile_dir / "proxy-stdout.log"
+    stderr_path = profile_dir / "proxy-stderr.log"
+    stdout_f = open(stdout_path, "w", encoding="utf-8")
+    stderr_f = open(stderr_path, "w", encoding="utf-8")
+    proc = subprocess.Popen(
+        [
+            str(binary_path),
+            "--headless",
+            "--data-dir",
+            str(profile_dir),
+            "--port",
+            str(port),
+        ],
+        env=env,
+        stdout=stdout_f,
+        stderr=stderr_f,
+        text=True,
+    )
+    return proc, stdout_f, stderr_f, stdout_path, stderr_path
+
+
+def wait_for_health(
+    port: int,
+    proc: subprocess.Popen,
+    stdout_path: Path,
+    stderr_path: Path,
+    timeout_sec: float = 15.0,
+):
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         if proc.poll() is not None:
-            out, err = proc.communicate()
             raise RuntimeError(
-                f"Proxy exited early with code {proc.returncode}:\nSTDOUT:\n{out}\nSTDERR:\n{err}"
+                f"Proxy exited early with code {proc.returncode}:\n"
+                f"STDOUT:\n{read_log_file(stdout_path)}\n"
+                f"STDERR:\n{read_log_file(stderr_path)}"
             )
         try:
             status, payload = http_request(port, "GET", "/health", timeout=1.5)
@@ -314,7 +358,11 @@ def wait_for_health(port: int, proc: subprocess.Popen, timeout_sec: float = 15.0
                 return payload
         except Exception:
             time.sleep(0.2)
-    raise TimeoutError(f"Timed out waiting for proxy /health on 127.0.0.1:{port}")
+    raise TimeoutError(
+        f"Timed out waiting for proxy /health on 127.0.0.1:{port}\n"
+        f"STDOUT:\n{read_log_file(stdout_path)}\n"
+        f"STDERR:\n{read_log_file(stderr_path)}"
+    )
 
 
 def run_startup_guard_tests(binary_path: Path, temp_root: Path):
@@ -437,29 +485,19 @@ def main():
         while proxy_port == 8045:
             proxy_port = find_free_port()
         profile_dir = temp_root / "isolated-tinix-profile"
-        write_isolated_profile(profile_dir, port=proxy_port, request_timeout=2)
+        write_isolated_profile(profile_dir, port=proxy_port, request_timeout=10)
 
         env = os.environ.copy()
         env["TINIX_M0_MOCK_UPSTREAM_URL"] = mock_upstream_url
+        env["TINIX_M0_MOCK_UPSTREAM_TIMEOUT_MS"] = "1500"
         env["ABV_DATA_DIR"] = str(profile_dir)
 
-        proc = subprocess.Popen(
-            [
-                str(binary_path),
-                "--headless",
-                "--data-dir",
-                str(profile_dir),
-                "--port",
-                str(proxy_port),
-            ],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        proc, stdout_f, stderr_f, stdout_path, stderr_path = spawn_proxy_process(
+            binary_path, profile_dir, proxy_port, env
         )
 
         try:
-            health = wait_for_health(proxy_port, proc)
+            health = wait_for_health(proxy_port, proc, stdout_path, stderr_path)
             assert health.get("buildFeature") == "tinix-m0-hardened", f"Unexpected health: {health}"
             m0_policy = health.get("m0Policy", {})
             assert m0_policy.get("maxUpstreamAttemptsPerRequest") == 1
@@ -564,8 +602,8 @@ def main():
                     {"scenario": f"http_{code}_single_attempt", "status": st, "upstreamAttempts": len(calls), "passed": True}
                 )
 
-            # Scenario: Upstream Timeout (request_timeout=2s, mock sleeps 3.5s)
-            mock_state.reset(mode="200", delay_sec=3.5)
+            # Scenario: Upstream Timeout (TINIX_M0_MOCK_UPSTREAM_TIMEOUT_MS=1500ms, mock sleeps 2.5s)
+            mock_state.reset(mode="200", delay_sec=2.5)
             st_timeout, _ = http_request(
                 proxy_port,
                 "POST",
@@ -610,7 +648,7 @@ def main():
             )
 
             # Scenario: Interrupted Client Request (client closes socket while upstream is in-flight)
-            mock_state.reset(mode="200", delay_sec=1.2)
+            mock_state.reset(mode="200", delay_sec=0.8)
             conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=5)
             body_interrupted = json.dumps(
                 {
@@ -630,7 +668,7 @@ def main():
             )
             time.sleep(0.25)
             conn.close()
-            time.sleep(1.5)
+            time.sleep(1.0)
             calls_interrupted = mock_state.get_calls()
             assert len(calls_interrupted) == 1, f"Expected 1 upstream attempt on interrupted request, got {len(calls_interrupted)}"
             report["scenarios"].append(
@@ -721,7 +759,7 @@ def main():
             assert m0_db.exists()
             with sqlite3.connect(m0_db) as conn_db:
                 used_count = conn_db.execute(
-                    "SELECT used_count FROM tinix_m0_attempt_counter WHERE id = 1"
+                    "SELECT used FROM tinix_m0_attempt_counter WHERE singleton = 1"
                 ).fetchone()[0]
                 req_rows = conn_db.execute(
                     "SELECT COUNT(*) FROM tinix_m0_request_attempts"
@@ -730,12 +768,22 @@ def main():
             assert used_count == 10, f"Expected 10 total upstream attempts in DB, got {used_count}"
             assert req_rows == 10, f"Expected 10 unique correlation_id rows, got {req_rows}"
 
+        except Exception:
+            stdout_f.flush()
+            stderr_f.flush()
+            print("=== PROC1 STDOUT ===", file=sys.stderr)
+            print(read_log_file(stdout_path), file=sys.stderr)
+            print("=== PROC1 STDERR ===", file=sys.stderr)
+            print(read_log_file(stderr_path), file=sys.stderr)
+            raise
         finally:
             proc.terminate()
             try:
                 proc.wait(timeout=5)
             except Exception:
                 proc.kill()
+            stdout_f.close()
+            stderr_f.close()
 
         # Second subprocess check: Account missing exact model ("gemini-3.1-flash-image")
         proxy_port_2 = find_free_port()
@@ -749,23 +797,13 @@ def main():
         )
         env2 = os.environ.copy()
         env2["TINIX_M0_MOCK_UPSTREAM_URL"] = mock_upstream_url
+        env2["TINIX_M0_MOCK_UPSTREAM_TIMEOUT_MS"] = "1500"
         env2["ABV_DATA_DIR"] = str(profile_dir_2)
-        proc2 = subprocess.Popen(
-            [
-                str(binary_path),
-                "--headless",
-                "--data-dir",
-                str(profile_dir_2),
-                "--port",
-                str(proxy_port_2),
-            ],
-            env=env2,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        proc2, stdout2_f, stderr2_f, stdout2_path, stderr2_path = spawn_proxy_process(
+            binary_path, profile_dir_2, proxy_port_2, env2
         )
         try:
-            wait_for_health(proxy_port_2, proc2)
+            wait_for_health(proxy_port_2, proc2, stdout2_path, stderr2_path)
             st_models2, models2 = http_request(proxy_port_2, "GET", "/v1/models")
             assert st_models2 == 200
             ids2 = [m.get("id") for m in models2.get("data", [])]
@@ -786,7 +824,7 @@ def main():
                 },
             )
             calls_unavail = mock_state.get_calls()
-            assert st_unavail == 400
+            assert st_unavail == 400, f"Expected 400 when account lacks exact model, got {st_unavail}: {msg_unavail}"
             assert "MODEL_UNAVAILABLE_ON_ACCOUNT" in str(msg_unavail)
             assert len(calls_unavail) == 0
             report["scenarios"].append(
@@ -797,12 +835,22 @@ def main():
                     "passed": True,
                 }
             )
+        except Exception:
+            stdout2_f.flush()
+            stderr2_f.flush()
+            print("=== PROC2 STDOUT ===", file=sys.stderr)
+            print(read_log_file(stdout2_path), file=sys.stderr)
+            print("=== PROC2 STDERR ===", file=sys.stderr)
+            print(read_log_file(stderr2_path), file=sys.stderr)
+            raise
         finally:
             proc2.terminate()
             try:
                 proc2.wait(timeout=5)
             except Exception:
                 proc2.kill()
+            stdout2_f.close()
+            stderr2_f.close()
 
         # Third subprocess check: custom_mapping attempting to rewrite gemini-3.1-flash-image is blocked
         proxy_port_3 = find_free_port()
@@ -817,23 +865,13 @@ def main():
         )
         env3 = os.environ.copy()
         env3["TINIX_M0_MOCK_UPSTREAM_URL"] = mock_upstream_url
+        env3["TINIX_M0_MOCK_UPSTREAM_TIMEOUT_MS"] = "1500"
         env3["ABV_DATA_DIR"] = str(profile_dir_3)
-        proc3 = subprocess.Popen(
-            [
-                str(binary_path),
-                "--headless",
-                "--data-dir",
-                str(profile_dir_3),
-                "--port",
-                str(proxy_port_3),
-            ],
-            env=env3,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+        proc3, stdout3_f, stderr3_f, stdout3_path, stderr3_path = spawn_proxy_process(
+            binary_path, profile_dir_3, proxy_port_3, env3
         )
         try:
-            wait_for_health(proxy_port_3, proc3)
+            wait_for_health(proxy_port_3, proc3, stdout3_path, stderr3_path)
             mock_state.reset(mode="200")
             st_rewrite, msg_rewrite = http_request(
                 proxy_port_3,
@@ -860,12 +898,22 @@ def main():
                     "passed": True,
                 }
             )
+        except Exception:
+            stdout3_f.flush()
+            stderr3_f.flush()
+            print("=== PROC3 STDOUT ===", file=sys.stderr)
+            print(read_log_file(stdout3_path), file=sys.stderr)
+            print("=== PROC3 STDERR ===", file=sys.stderr)
+            print(read_log_file(stderr3_path), file=sys.stderr)
+            raise
         finally:
             proc3.terminate()
             try:
                 proc3.wait(timeout=5)
             except Exception:
                 proc3.kill()
+            stdout3_f.close()
+            stderr3_f.close()
 
         report["allPassed"] = True
     finally:

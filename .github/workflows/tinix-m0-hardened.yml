@@ -75,47 +75,6 @@ jobs:
 
           Copy-Item -LiteralPath 'src-tauri/resources/WebView2Loader.dll' -Destination 'src-tauri/target/release/WebView2Loader.dll' -Force
 
-      - name: Run Tinix M0 Rust unit tests & Subprocess Mock Verification (loopback-only firewall enforced)
-        shell: pwsh
-        env:
-          HTTP_PROXY: ""
-          HTTPS_PROXY: ""
-          ALL_PROXY: ""
-          NO_PROXY: "127.0.0.1,localhost"
-        run: |
-          $testExecutable = (Get-Content "src-tauri/target/release/test-executable-path.txt" -Raw).Trim()
-          $releaseBinary = (Resolve-Path "src-tauri/target/release/antigravity-tools.exe").Path
-
-          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
-          New-NetFirewallRule -DisplayName 'TinixM0TestsLocalhostOnlyLib' `
-            -Direction Outbound `
-            -Action Block `
-            -Program $testExecutable `
-            -RemoteAddress '1.0.0.0-126.255.255.255','128.0.0.0-223.255.255.255','2000::/3' | Out-Null
-
-          New-NetFirewallRule -DisplayName 'TinixM0TestsLocalhostOnlyBin' `
-            -Direction Outbound `
-            -Action Block `
-            -Program $releaseBinary `
-            -RemoteAddress '1.0.0.0-126.255.255.255','128.0.0.0-223.255.255.255','2000::/3' | Out-Null
-
-          & $testExecutable proxy::image_attempt_budget::tests --nocapture --test-threads=1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          & $testExecutable proxy::upstream::client::native_image_live_test_mock_tests --nocapture --test-threads=1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          & $testExecutable proxy::token_manager::tests::model_quotas_keep_gemini_3_pro_and_3_1_flash_image_separate --exact --nocapture
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          & $testExecutable proxy::handlers::openai::native_image_live_test_count_tests --nocapture --test-threads=1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          python tests/tinix_m0_mock_verification.py `
-            --binary $releaseBinary `
-            --report src-tauri/target/release/m0-mock-test-report.json
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
       - name: Generate SHA-256 and M0 build manifest
         shell: pwsh
         run: |
@@ -161,6 +120,47 @@ jobs:
           Get-Content "src-tauri/target/release/sha256.txt"
           Get-Content "src-tauri/target/release/antigravity-tools.exe.m0-manifest.json"
 
+      - name: Run Tinix M0 Rust unit tests & Subprocess Mock Verification (loopback-only firewall enforced)
+        shell: pwsh
+        env:
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          NO_PROXY: "127.0.0.1,localhost"
+        run: |
+          $testExecutable = (Get-Content "src-tauri/target/release/test-executable-path.txt" -Raw).Trim()
+          $releaseBinary = (Resolve-Path "src-tauri/target/release/antigravity-tools.exe").Path
+
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
+          New-NetFirewallRule -DisplayName 'TinixM0TestsLocalhostOnlyLib' `
+            -Direction Outbound `
+            -Action Block `
+            -Program $testExecutable `
+            -RemoteAddress '1.0.0.0-126.255.255.255','128.0.0.0-223.255.255.255','2000::/3' | Out-Null
+
+          New-NetFirewallRule -DisplayName 'TinixM0TestsLocalhostOnlyBin' `
+            -Direction Outbound `
+            -Action Block `
+            -Program $releaseBinary `
+            -RemoteAddress '1.0.0.0-126.255.255.255','128.0.0.0-223.255.255.255','2000::/3' | Out-Null
+
+          & $testExecutable proxy::image_attempt_budget::tests --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $testExecutable proxy::upstream::client::native_image_live_test_mock_tests --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $testExecutable proxy::token_manager::tests::model_quotas_keep_gemini_3_pro_and_3_1_flash_image_separate --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $testExecutable proxy::handlers::openai::native_image_live_test_count_tests --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python tests/tinix_m0_mock_verification.py `
+            --binary $releaseBinary `
+            --report src-tauri/target/release/m0-mock-test-report.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Remove temporary firewall rules
         if: always()
         shell: pwsh
@@ -169,6 +169,7 @@ jobs:
           Remove-NetFirewallRule -DisplayName "TinixM0TestsLocalhostOnlyBin" -ErrorAction SilentlyContinue
 
       - name: Upload Tinix M0 hardened Windows artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tinix-m0-hardened-windows-x64
@@ -179,4 +180,5 @@ jobs:
             src-tauri/target/release/source-commit.txt
             src-tauri/target/release/sha256.txt
             src-tauri/target/release/m0-mock-test-report.json
-          if-no-files-found: error
+          if-no-files-found: warn
+
