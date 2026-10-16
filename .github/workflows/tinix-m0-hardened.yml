@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install NASM for aws-lc-sys / boring-sys
         shell: pwsh
@@ -38,14 +40,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-
-      - name: Verify NASM and compiler tools
-        shell: pwsh
-        run: |
-          nasm -v
-          cmake --version
-          rustc -Vv
-          cargo -V
+          cache-on-failure: true
 
       - name: Compile Rust tests and release binary with tinix-m0-hardened
         shell: pwsh
@@ -54,44 +49,33 @@ jobs:
           if (-not (Test-Path dist/index.html)) {
             Set-Content -Path dist/index.html -Value "<!doctype html><title>Tinix M0 Hardened Proxy</title>"
           }
-          cargo test --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --lib --no-run
-          cargo build --release --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --bin antigravity-tools
+          $manifest = 'src-tauri/Cargo.toml'
+          $buildMessages = cargo test --locked --release --manifest-path $manifest --lib --features tinix-m0-hardened --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $testExecutables = @($buildMessages | ForEach-Object {
+            try {
+              $message = $_ | ConvertFrom-Json -ErrorAction Stop
+              if ($message.reason -eq 'compiler-artifact' -and $message.profile.test -and $message.target.name -eq 'antigravity_tools_lib' -and $message.executable) {
+                $message.executable
+              }
+            } catch {}
+          })
+          if ($testExecutables.Count -lt 1) { throw 'Expected Rust lib test executable' }
+          $testExecutable = $testExecutables[-1]
+          Set-Content -Path "src-tauri/target/release/test-executable-path.txt" -Value $testExecutable -NoNewline
 
-      - name: Block all non-loopback outbound TCP traffic for mock tests
-        shell: pwsh
-        run: |
-          New-NetFirewallRule -DisplayName "TinixM0BlockPublicOutboundLow" `
-            -Direction Outbound `
-            -Action Block `
-            -Protocol TCP `
-            -RemoteAddress "1.0.0.0-126.255.255.255" `
-            -Profile Any | Out-Null
+          $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+          $manifestTool = Get-ChildItem "$sdkBin/*/x64/mt.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $manifestTool) { throw 'Windows SDK manifest tool (mt.exe) not found' }
+          & $manifestTool.FullName -nologo -manifest tests/windows_test_common_controls.xml "-outputresource:$testExecutable;#1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          New-NetFirewallRule -DisplayName "TinixM0BlockPublicOutboundHigh" `
-            -Direction Outbound `
-            -Action Block `
-            -Protocol TCP `
-            -RemoteAddress "128.0.0.0-255.255.255.255" `
-            -Profile Any | Out-Null
+          cargo build --locked --release --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --bin antigravity-tools
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          $googleBlocked = $false
-          try {
-            $client = [System.Net.Sockets.TcpClient]::new()
-            $iar = $client.BeginConnect("142.250.190.78", 443, $null, $null)
-            if ($iar.AsyncWaitHandle.WaitOne(2000, $false) -and $client.Connected) {
-              $googleBlocked = $false
-            } else {
-              $googleBlocked = $true
-            }
-            $client.Close()
-          } catch {
-            $googleBlocked = $true
-          }
-          if (-not $googleBlocked) {
-            throw "Public outbound TCP traffic was not blocked as required."
-          }
+          Copy-Item -LiteralPath 'src-tauri/resources/WebView2Loader.dll' -Destination 'src-tauri/target/release/WebView2Loader.dll' -Force
 
-      - name: Run Tinix M0 Rust unit tests (loopback only)
+      - name: Run Tinix M0 Rust unit tests & Subprocess Mock Verification (loopback-only firewall enforced)
         shell: pwsh
         env:
           HTTP_PROXY: ""
@@ -99,35 +83,53 @@ jobs:
           ALL_PROXY: ""
           NO_PROXY: "127.0.0.1,localhost"
         run: |
-          cargo test --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --lib proxy::image_attempt_budget::tests:: -- --nocapture --test-threads=1
-          cargo test --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --lib proxy::upstream::client::native_image_live_test_guard_tests:: -- --nocapture --test-threads=1
-          cargo test --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --lib proxy::token_manager::tests::model_quotas_keep_gemini_3_pro_and_3_1_flash_image_separate -- --exact --nocapture
-          cargo test --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --lib proxy::handlers::openai::native_image_live_test_count_tests:: -- --nocapture --test-threads=1
+          $testExecutable = (Get-Content "src-tauri/target/release/test-executable-path.txt" -Raw).Trim()
+          $releaseBinary = (Resolve-Path "src-tauri/target/release/antigravity-tools.exe").Path
 
-      - name: Run Tinix M0 End-to-End Subprocess Mock Verification Suite
-        shell: pwsh
-        env:
-          HTTP_PROXY: ""
-          HTTPS_PROXY: ""
-          ALL_PROXY: ""
-          NO_PROXY: "127.0.0.1,localhost"
-        run: |
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
+          New-NetFirewallRule -DisplayName 'TinixM0TestsLocalhostOnlyLib' `
+            -Direction Outbound `
+            -Action Block `
+            -Program $testExecutable `
+            -RemoteAddress '1.0.0.0-126.255.255.255','128.0.0.0-223.255.255.255','2000::/3' | Out-Null
+
+          New-NetFirewallRule -DisplayName 'TinixM0TestsLocalhostOnlyBin' `
+            -Direction Outbound `
+            -Action Block `
+            -Program $releaseBinary `
+            -RemoteAddress '1.0.0.0-126.255.255.255','128.0.0.0-223.255.255.255','2000::/3' | Out-Null
+
+          & $testExecutable proxy::image_attempt_budget::tests --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $testExecutable proxy::upstream::client::native_image_live_test_mock_tests --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $testExecutable proxy::token_manager::tests::model_quotas_keep_gemini_3_pro_and_3_1_flash_image_separate --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $testExecutable proxy::handlers::openai::native_image_live_test_count_tests --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           python tests/tinix_m0_mock_verification.py `
-            --binary src-tauri/target/release/antigravity-tools.exe `
+            --binary $releaseBinary `
             --report src-tauri/target/release/m0-mock-test-report.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Generate SHA-256 and M0 build manifest
         shell: pwsh
         run: |
           $bin = "src-tauri/target/release/antigravity-tools.exe"
+          $loader = "src-tauri/target/release/WebView2Loader.dll"
           if (-not (Test-Path $bin)) {
             throw "Expected binary not found at $bin"
           }
           $hash = (Get-FileHash -Algorithm SHA256 $bin).Hash.ToLowerInvariant()
+          $loaderHash = (Get-FileHash -Algorithm SHA256 $loader).Hash.ToLowerInvariant()
           $commit = (git rev-parse HEAD).Trim()
           $builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-          Set-Content -Path "src-tauri/target/release/source-commit.txt" -Value $commit
-          Set-Content -Path "src-tauri/target/release/sha256.txt" -Value "$hash  antigravity-tools.exe"
+          Set-Content -Path "src-tauri/target/release/source-commit.txt" -Value $commit -NoNewline
+          Set-Content -Path "src-tauri/target/release/sha256.txt" -Value "$hash  antigravity-tools.exe`n$loaderHash  WebView2Loader.dll" -NoNewline
 
           $manifest = [ordered]@{
             schemaVersion = 1
@@ -137,6 +139,7 @@ jobs:
             commitSha = $commit
             binaryName = "antigravity-tools.exe"
             binarySha256 = $hash
+            webView2LoaderSha256 = $loaderHash
             builtAt = $builtAt
             retryPolicy = "zero-retries"
             retryZeroVerified = $true
@@ -162,8 +165,8 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          Remove-NetFirewallRule -DisplayName "TinixM0BlockPublicOutboundLow" -ErrorAction SilentlyContinue
-          Remove-NetFirewallRule -DisplayName "TinixM0BlockPublicOutboundHigh" -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName "TinixM0TestsLocalhostOnlyLib" -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName "TinixM0TestsLocalhostOnlyBin" -ErrorAction SilentlyContinue
 
       - name: Upload Tinix M0 hardened Windows artifact
         uses: actions/upload-artifact@v4
@@ -171,6 +174,7 @@ jobs:
           name: tinix-m0-hardened-windows-x64
           path: |
             src-tauri/target/release/antigravity-tools.exe
+            src-tauri/target/release/WebView2Loader.dll
             src-tauri/target/release/antigravity-tools.exe.m0-manifest.json
             src-tauri/target/release/source-commit.txt
             src-tauri/target/release/sha256.txt
