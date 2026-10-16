@@ -5318,24 +5318,25 @@ pub async fn handle_images_generations_internal(
         }
         let custom_mapping = state.custom_mapping.read().await;
         if !custom_mapping.is_empty() {
-            let route = crate::proxy::common::model_mapping::resolve_custom_model_route(
+            if let Some(target_model) = crate::proxy::common::model_mapping::resolve_custom_model_route(
                 explicit_model,
                 &custom_mapping,
-            );
-            if route.target_model != explicit_model {
-                let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
-                    explicit_model,
-                    "",
-                    "custom_model_mapping_forbidden",
-                );
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "MODEL_REWRITE_FORBIDDEN: custom_mapping attempted to rewrite '{}' to '{}'.",
-                        explicit_model, route.target_model
-                    ),
-                    None,
-                ));
+            ) {
+                if target_model != explicit_model {
+                    let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+                        explicit_model,
+                        "",
+                        "custom_model_mapping_forbidden",
+                    );
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "MODEL_REWRITE_FORBIDDEN: custom_mapping attempted to rewrite '{}' to '{}'.",
+                            explicit_model, target_model
+                        ),
+                        None,
+                    ));
+                }
             }
         }
         explicit_model

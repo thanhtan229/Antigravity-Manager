@@ -918,8 +918,7 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
         }
     }
 
-    #[cfg(all(feature = "tinix-m0-hardened", not(test)))]
-    {
+    if cfg!(all(feature = "tinix-m0-hardened", not(test))) {
         return Err(
             "TINIX_M0_PROFILE_REQUIRED: Tinix M0 hardened proxy requires an explicit isolated profile via --data-dir or ABV_DATA_DIR; fallback to default ~/.antigravity_tools is forbidden."
                 .to_string(),
@@ -968,7 +967,7 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
         ensure_dir(&fallback_test_dir)?;
         Ok(fallback_test_dir)
     }
-    #[cfg(all(not(test), not(feature = "tinix-m0-hardened")))]
+    #[cfg(not(test))]
     {
         let data_dir = default_data_dir()?;
         ensure_dir(&data_dir)?;

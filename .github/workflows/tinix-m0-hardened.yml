@@ -138,6 +138,7 @@ jobs:
             binaryName = "antigravity-tools.exe"
             binarySha256 = $hash
             builtAt = $builtAt
+            retryPolicy = "zero-retries"
             retryZeroVerified = $true
             maxRetries = 0
             maxUpstreamAttemptsPerRequest = 1
