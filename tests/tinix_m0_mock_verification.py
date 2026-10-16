@@ -168,6 +168,12 @@ def write_isolated_profile(
     )
 
     gui_config = {
+        "language": "en",
+        "theme": "dark",
+        "auto_refresh": False,
+        "refresh_interval": 15,
+        "auto_sync": False,
+        "sync_interval": 30,
         "proxy": {
             "enabled": True,
             "port": port,
