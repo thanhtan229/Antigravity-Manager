@@ -313,7 +313,9 @@ impl TokenManager {
     /// 启动所有后台维护任务（限流清理与 Token 主动预刷新）
     pub async fn start_auto_cleanup(self: &Arc<Self>) {
         self.start_rate_limit_cleanup().await;
-        self.start_proactive_token_refresh().await;
+        if !crate::proxy::upstream::client::is_mock_upstream_override_active() {
+            self.start_proactive_token_refresh().await;
+        }
     }
 
     /// 执行一次主动预刷新检查轮次
@@ -1071,10 +1073,16 @@ impl TokenManager {
                     model.get("name").and_then(|v| v.as_str()),
                     model.get("percentage").and_then(|v| v.as_i64()),
                 ) {
-                    // Normalize name to standard ID
-                    let standard_id =
+                    // Normalize name to standard ID (except in tinix-m0-hardened where image models
+                    // must match their exact model ID without normalizing gemini-3-flash-image -> gemini-3.1-flash-image)
+                    let standard_id = if cfg!(feature = "tinix-m0-hardened")
+                        && name.to_ascii_lowercase().contains("image")
+                    {
+                        name.trim().to_ascii_lowercase()
+                    } else {
                         crate::proxy::common::model_mapping::normalize_to_standard_id(name)
-                            .unwrap_or_else(|| name.to_string());
+                            .unwrap_or_else(|| name.to_string())
+                    };
                     model_quotas.insert(standard_id, pct as i32);
                 }
                 // [NEW] 解析并缓存 max_output_tokens (按原始 model name，不归一化)
@@ -1482,11 +1490,45 @@ impl TokenManager {
         Some(out)
     }
 
+    pub fn account_lists_exact_model(&self, account_id: &str, exact_model: &str) -> bool {
+        let target = exact_model.trim().to_ascii_lowercase();
+        if target.is_empty() {
+            return false;
+        }
+        let account_path = match self.tokens.get(account_id) {
+            Some(token) => token.account_path.clone(),
+            None => return false,
+        };
+        match Self::get_available_models_from_json(&account_path) {
+            Some(models) => models.contains(&target),
+            None => false,
+        }
+    }
+
+    pub fn any_account_lists_exact_model(&self, exact_model: &str) -> bool {
+        let target = exact_model.trim().to_ascii_lowercase();
+        if target.is_empty() {
+            return false;
+        }
+        for entry in self.tokens.iter() {
+            let path = entry.value().account_path.clone();
+            if let Some(models) = Self::get_available_models_from_json(&path) {
+                if models.contains(&target) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub async fn resolve_dynamic_model_for_account(
         &self,
         account_id: &str,
         mapped_model: &str,
     ) -> String {
+        if cfg!(feature = "tinix-m0-hardened") {
+            return mapped_model.to_string();
+        }
         let candidates = match Self::build_dynamic_model_candidates(mapped_model) {
             Some(c) => c,
             None => return mapped_model.to_string(),

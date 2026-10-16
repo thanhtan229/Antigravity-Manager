@@ -1303,11 +1303,33 @@ fn bind_tcp_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener, S
 
 /// 健康检查处理器
 async fn health_check_handler() -> Response {
-    Json(serde_json::json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION")
-    }))
-    .into_response()
+    if cfg!(feature = "tinix-m0-hardened") {
+        Json(serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "buildFeature": "tinix-m0-hardened",
+            "m0Policy": {
+                "maxUpstreamAttemptsPerRequest": 1,
+                "maxRetries": 0,
+                "accountRotation": false,
+                "endpointFallback": false,
+                "http2Retry": 0,
+                "redirectPolicy": "none",
+                "promptEnhancement": false,
+                "exactModelOnly": "gemini-3.1-flash-image",
+                "allowedImageSizes": ["2K", "4K"],
+                "allowedAspectRatios": ["1:1"],
+                "allowedImageCount": 1
+            }
+        }))
+        .into_response()
+    } else {
+        Json(serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION")
+        }))
+        .into_response()
+    }
 }
 
 /// 静默成功处理器 (用于拦截遥测日志等)

@@ -1,0 +1,177 @@
+name: Tinix M0 Hardened Proxy Build & Mock Verification
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/tinix-m0-hardened-proxy
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-and-build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install NASM for aws-lc-sys / boring-sys
+        shell: pwsh
+        run: |
+          choco install nasm cmake ninja -y --no-progress
+          $nasmCandidates = @(
+            "C:\Program Files\NASM",
+            "C:\ProgramData\chocolatey\bin"
+          ) | Where-Object { Test-Path $_ }
+          foreach ($dir in $nasmCandidates) {
+            echo $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Verify NASM and compiler tools
+        shell: pwsh
+        run: |
+          nasm -v
+          cmake --version
+          rustc -Vv
+          cargo -V
+
+      - name: Compile Rust tests and release binary with tinix-m0-hardened
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          if (-not (Test-Path dist/index.html)) {
+            Set-Content -Path dist/index.html -Value "<!doctype html><title>Tinix M0 Hardened Proxy</title>"
+          }
+          cargo test --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --lib --no-run
+          cargo build --release --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --bin antigravity-tools
+
+      - name: Block all non-loopback outbound TCP traffic for mock tests
+        shell: pwsh
+        run: |
+          New-NetFirewallRule -DisplayName "TinixM0BlockPublicOutboundLow" `
+            -Direction Outbound `
+            -Action Block `
+            -Protocol TCP `
+            -RemoteAddress "1.0.0.0-126.255.255.255" `
+            -Profile Any | Out-Null
+
+          New-NetFirewallRule -DisplayName "TinixM0BlockPublicOutboundHigh" `
+            -Direction Outbound `
+            -Action Block `
+            -Protocol TCP `
+            -RemoteAddress "128.0.0.0-255.255.255.255" `
+            -Profile Any | Out-Null
+
+          $googleBlocked = $false
+          try {
+            $client = [System.Net.Sockets.TcpClient]::new()
+            $iar = $client.BeginConnect("142.250.190.78", 443, $null, $null)
+            if ($iar.AsyncWaitHandle.WaitOne(2000, $false) -and $client.Connected) {
+              $googleBlocked = $false
+            } else {
+              $googleBlocked = $true
+            }
+            $client.Close()
+          } catch {
+            $googleBlocked = $true
+          }
+          if (-not $googleBlocked) {
+            throw "Public outbound TCP traffic was not blocked as required."
+          }
+
+      - name: Run Tinix M0 Rust unit tests (loopback only)
+        shell: pwsh
+        env:
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          NO_PROXY: "127.0.0.1,localhost"
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --lib proxy::image_attempt_budget::tests:: -- --nocapture --test-threads=1
+          cargo test --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --lib proxy::upstream::client::native_image_live_test_guard_tests:: -- --nocapture --test-threads=1
+          cargo test --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --lib proxy::token_manager::tests::model_quotas_keep_gemini_3_pro_and_3_1_flash_image_separate -- --exact --nocapture
+          cargo test --manifest-path src-tauri/Cargo.toml --features tinix-m0-hardened --lib proxy::handlers::openai::native_image_live_test_count_tests:: -- --nocapture --test-threads=1
+
+      - name: Run Tinix M0 End-to-End Subprocess Mock Verification Suite
+        shell: pwsh
+        env:
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          NO_PROXY: "127.0.0.1,localhost"
+        run: |
+          python tests/tinix_m0_mock_verification.py `
+            --binary src-tauri/target/release/antigravity-tools.exe `
+            --report src-tauri/target/release/m0-mock-test-report.json
+
+      - name: Generate SHA-256 and M0 build manifest
+        shell: pwsh
+        run: |
+          $bin = "src-tauri/target/release/antigravity-tools.exe"
+          if (-not (Test-Path $bin)) {
+            throw "Expected binary not found at $bin"
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 $bin).Hash.ToLowerInvariant()
+          $commit = (git rev-parse HEAD).Trim()
+          $builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          Set-Content -Path "src-tauri/target/release/source-commit.txt" -Value $commit
+          Set-Content -Path "src-tauri/target/release/sha256.txt" -Value "$hash  antigravity-tools.exe"
+
+          $manifest = [ordered]@{
+            schemaVersion = 1
+            application = "tinix-media-creator"
+            providerId = "antigravity-local"
+            buildFeature = "tinix-m0-hardened"
+            commitSha = $commit
+            binaryName = "antigravity-tools.exe"
+            binarySha256 = $hash
+            builtAt = $builtAt
+            retryZeroVerified = $true
+            maxRetries = 0
+            maxUpstreamAttemptsPerRequest = 1
+            accountRotation = $false
+            endpointFallback = $false
+            http2MaxRetryCount = 0
+            redirectPolicy = "none"
+            promptModification = $false
+            exactModelRequired = "gemini-3.1-flash-image"
+            allowedImageSizes = @("2K", "4K")
+            allowedAspectRatios = @("1:1")
+            allowedImageCount = 1
+            forbidsPort8045 = $true
+            requiresIsolatedProfile = $true
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content -Path "src-tauri/target/release/antigravity-tools.exe.m0-manifest.json" -Encoding utf8
+          Get-Content "src-tauri/target/release/sha256.txt"
+          Get-Content "src-tauri/target/release/antigravity-tools.exe.m0-manifest.json"
+
+      - name: Remove temporary firewall rules
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-NetFirewallRule -DisplayName "TinixM0BlockPublicOutboundLow" -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName "TinixM0BlockPublicOutboundHigh" -ErrorAction SilentlyContinue
+
+      - name: Upload Tinix M0 hardened Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinix-m0-hardened-windows-x64
+          path: |
+            src-tauri/target/release/antigravity-tools.exe
+            src-tauri/target/release/antigravity-tools.exe.m0-manifest.json
+            src-tauri/target/release/source-commit.txt
+            src-tauri/target/release/sha256.txt
+            src-tauri/target/release/m0-mock-test-report.json
+          if-no-files-found: error

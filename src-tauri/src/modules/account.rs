@@ -880,12 +880,36 @@ fn apply_data_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub fn validate_tinix_m0_isolated_data_dir(data_dir: &Path) -> Result<(), String> {
+    let key = path_compare_key(data_dir);
+    if key.contains(".antigravity_tools")
+        || key.contains("source-audit")
+        || key.ends_with("/.runtime/profile")
+        || key.contains("/.runtime/profile/")
+    {
+        return Err(format!(
+            "TINIX_M0_PROFILE_ISOLATION_VIOLATION: forbidden research or default profile path '{}'",
+            format_data_dir_path(data_dir)
+        ));
+    }
+    if data_dir.join("native_image_attempt_budget.sqlite3").exists() {
+        return Err(format!(
+            "TINIX_M0_PROFILE_ISOLATION_VIOLATION: research 3/5 budget database found in '{}'",
+            format_data_dir_path(data_dir)
+        ));
+    }
+    Ok(())
+}
+
 /// Get data directory path
 pub fn get_data_dir() -> Result<PathBuf, String> {
     // 1. Process env (tests, Docker, and in-process override after migrate)
     if let Ok(env_path) = std::env::var("ABV_DATA_DIR") {
         if !env_path.trim().is_empty() {
             let data_dir = normalize_data_dir_path(&env_path);
+            if cfg!(feature = "tinix-m0-hardened") {
+                validate_tinix_m0_isolated_data_dir(&data_dir)?;
+            }
             ensure_dir(&data_dir)?;
             if format_data_dir_path(&data_dir) != env_path {
                 persist_clean_env(&data_dir);
@@ -894,22 +918,35 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
         }
     }
 
+    #[cfg(all(feature = "tinix-m0-hardened", not(test)))]
+    {
+        return Err(
+            "TINIX_M0_PROFILE_REQUIRED: Tinix M0 hardened proxy requires an explicit isolated profile via --data-dir or ABV_DATA_DIR; fallback to default ~/.antigravity_tools is forbidden."
+                .to_string(),
+        );
+    }
+
     // 2. Runtime override (pointer already loaded this session)
     if let Ok(guard) = data_dir_override_slot().read() {
         if let Some(ref path) = *guard {
             let data_dir = normalize_data_dir_path(path);
+            if cfg!(feature = "tinix-m0-hardened") {
+                validate_tinix_m0_isolated_data_dir(&data_dir)?;
+            }
             ensure_dir(&data_dir)?;
             return Ok(data_dir);
         }
     }
 
     // 3. Pointer file outside the data dir so deleting the old folder still finds the new path
-    if let Some(path) = read_location_pointer() {
-        ensure_dir(&path)?;
-        if let Ok(mut guard) = data_dir_override_slot().write() {
-            *guard = Some(path.clone());
+    if !cfg!(feature = "tinix-m0-hardened") {
+        if let Some(path) = read_location_pointer() {
+            ensure_dir(&path)?;
+            if let Ok(mut guard) = data_dir_override_slot().write() {
+                *guard = Some(path.clone());
+            }
+            return Ok(path);
         }
-        return Ok(path);
     }
 
     // 4. Default ~/.antigravity_tools
@@ -931,7 +968,7 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
         ensure_dir(&fallback_test_dir)?;
         Ok(fallback_test_dir)
     }
-    #[cfg(not(test))]
+    #[cfg(all(not(test), not(feature = "tinix-m0-hardened")))]
     {
         let data_dir = default_data_dir()?;
         ensure_dir(&data_dir)?;

@@ -4902,8 +4902,19 @@ pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoRespo
     use crate::proxy::common::model_mapping::get_all_dynamic_models;
 
     let only_raw = *state.only_raw_quota_models.read().await;
-    let model_ids =
+    let mut model_ids =
         get_all_dynamic_models(&state.custom_mapping, Some(&state.token_manager), only_raw).await;
+
+    if cfg!(feature = "tinix-m0-hardened") && state.token_manager.len() > 0 {
+        if !state
+            .token_manager
+            .any_account_lists_exact_model("gemini-3.1-flash-image")
+        {
+            model_ids.retain(|id| {
+                id != "gemini-3.1-flash-image" && !id.starts_with("gemini-3.1-flash-image-")
+            });
+        }
+    }
 
     let data: Vec<_> = model_ids
         .into_iter()
@@ -4991,15 +5002,17 @@ async fn intercept_chat_to_image(
     if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
         for msg in messages {
             if msg.get("role").and_then(|v| v.as_str()) == Some("user") {
-                if let Some(content) = msg.get("content") {
-                    if let Some(s) = content.as_str() {
-                        prompt = s.to_string();
-                    } else if let Some(arr) = content.as_array() {
-                        for part in arr {
-                            if part.get("type").and_then(|v| v.as_str()) == Some("text") {
-                                prompt.push_str(
-                                    part.get("text").and_then(|v| v.as_str()).unwrap_or(""),
-                                );
+                if Some(true) == msg.get("content").map(|c| c.is_string() || c.is_array()) {
+                    if let Some(content) = msg.get("content") {
+                        if let Some(s) = content.as_str() {
+                            prompt = s.to_string();
+                        } else if let Some(arr) = content.as_array() {
+                            for part in arr {
+                                if part.get("type").and_then(|v| v.as_str()) == Some("text") {
+                                    prompt.push_str(
+                                        part.get("text").and_then(|v| v.as_str()).unwrap_or(""),
+                                    );
+                                }
                             }
                         }
                     }
@@ -5146,15 +5159,95 @@ pub async fn handle_images_generations(
 }
 
 fn image_generation_count_allowed_for_build(n: usize) -> bool {
-    !cfg!(feature = "native-image-live-test") || n == 1
+    !crate::proxy::upstream::client::is_hardened_image_build() || n == 1
 }
 
 fn image_generation_account_attempt_limit(pool_size: usize) -> usize {
-    if cfg!(feature = "native-image-live-test") {
+    if crate::proxy::upstream::client::is_hardened_image_build() {
         1
     } else {
         crate::proxy::handlers::common::calculate_max_retry_attempts(pool_size)
     }
+}
+
+fn resolve_tinix_m0_image_config(
+    body: &Value,
+    size: Option<&str>,
+    image_size_param: Option<&str>,
+) -> Result<(Value, String), (&'static str, String)> {
+    if let Some(aspect_ratio_val) = body.get("aspect_ratio").or_else(|| body.get("aspectRatio")) {
+        if !aspect_ratio_val.is_null() {
+            let Some(ar) = aspect_ratio_val.as_str() else {
+                return Err((
+                    "invalid_aspect_ratio",
+                    "Invalid aspect_ratio: Tinix M0 hardened proxy only supports '1:1'.".to_string(),
+                ));
+            };
+            if ar.trim() != "1:1" {
+                return Err((
+                    "unsupported_aspect_ratio",
+                    format!(
+                        "Unsupported aspect_ratio '{}': Tinix M0 hardened proxy only supports '1:1'.",
+                        ar
+                    ),
+                ));
+            }
+        }
+    }
+
+    let size_implied_tier = match size.map(str::trim) {
+        None | Some("") | Some("1:1") | Some("1024x1024") => None,
+        Some("2048x2048") => Some("2K"),
+        Some("4096x4096") => Some("4K"),
+        Some(other) => {
+            return Err((
+                "unsupported_size_or_aspect_ratio",
+                format!(
+                    "Unsupported size '{}': Tinix M0 hardened proxy only supports 1:1 square sizes ('2048x2048', '4096x4096', '1024x1024', or '1:1').",
+                    other
+                ),
+            ));
+        }
+    };
+
+    let explicit_tier = match image_size_param.map(str::trim) {
+        None | Some("") => None,
+        Some(raw) if raw.eq_ignore_ascii_case("2K") => Some("2K"),
+        Some(raw) if raw.eq_ignore_ascii_case("4K") => Some("4K"),
+        Some(other) => {
+            return Err((
+                "unsupported_image_size",
+                format!(
+                    "Unsupported image_size '{}': Tinix M0 hardened proxy only supports '2K' or '4K' without silent downgrade or upscale.",
+                    other
+                ),
+            ));
+        }
+    };
+
+    let final_tier = match (explicit_tier, size_implied_tier) {
+        (Some(exp), Some(imp)) if exp != imp => {
+            return Err((
+                "conflicting_size_and_image_size",
+                format!(
+                    "Conflicting resolution parameters: image_size='{}' conflicts with size='{}'.",
+                    exp,
+                    size.unwrap_or_default()
+                ),
+            ));
+        }
+        (Some(exp), _) => exp,
+        (None, Some(imp)) => imp,
+        (None, None) => "2K",
+    };
+
+    Ok((
+        json!({
+            "aspectRatio": "1:1",
+            "imageSize": final_tier,
+        }),
+        final_tier.to_string(),
+    ))
 }
 
 pub async fn handle_images_generations_internal(
@@ -5164,11 +5257,23 @@ pub async fn handle_images_generations_internal(
     body: Value,
 ) -> Result<(String, Value), (StatusCode, String, Option<String>)> {
     // 1. 解析请求参数
-    let prompt = body.get("prompt").and_then(|v| v.as_str()).ok_or((
-        StatusCode::BAD_REQUEST,
-        "Missing 'prompt' field".to_string(),
-        None,
-    ))?;
+    let prompt = match body.get("prompt").and_then(|v| v.as_str()) {
+        Some(p) if !cfg!(feature = "tinix-m0-hardened") || !p.trim().is_empty() => p,
+        _ => {
+            if cfg!(feature = "tinix-m0-hardened") {
+                let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+                    "",
+                    "",
+                    "missing_or_empty_prompt",
+                );
+            }
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Missing 'prompt' field".to_string(),
+                None,
+            ));
+        }
+    };
     let affinity_key = crate::proxy::thinking_store::SessionScope::resolve(
         &headers,
         Some(&body),
@@ -5178,16 +5283,91 @@ pub async fn handle_images_generations_internal(
     )
     .affinity_key;
 
-    let model = body
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or("gemini-3.1-flash-image");
+    let model = if cfg!(feature = "tinix-m0-hardened") {
+        let Some(explicit_model) = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        else {
+            let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+                "",
+                "",
+                "missing_model_field",
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Missing required 'model' field: Tinix M0 hardened proxy requires exact model 'gemini-3.1-flash-image'.".to_string(),
+                None,
+            ));
+        };
+        if explicit_model != "gemini-3.1-flash-image" {
+            let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+                explicit_model,
+                "",
+                "unsupported_or_non_exact_model",
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Unsupported or non-exact model '{}': Tinix M0 hardened proxy only allows exact model 'gemini-3.1-flash-image' without aliases, suffixes, or fallback.",
+                    explicit_model
+                ),
+                None,
+            ));
+        }
+        let custom_mapping = state.custom_mapping.read().await;
+        if !custom_mapping.is_empty() {
+            let route = crate::proxy::common::model_mapping::resolve_custom_model_route(
+                explicit_model,
+                &custom_mapping,
+            );
+            if route.target_model != explicit_model {
+                let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+                    explicit_model,
+                    "",
+                    "custom_model_mapping_forbidden",
+                );
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "MODEL_REWRITE_FORBIDDEN: custom_mapping attempted to rewrite '{}' to '{}'.",
+                        explicit_model, route.target_model
+                    ),
+                    None,
+                ));
+            }
+        }
+        explicit_model
+    } else {
+        body.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("gemini-3.1-flash-image")
+    };
 
-    let n = body.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let n = if cfg!(feature = "tinix-m0-hardened") {
+        match body.get("n") {
+            None => 1usize,
+            Some(v) if v.is_null() => 1usize,
+            Some(v) => match v.as_u64() {
+                Some(parsed) => parsed as usize,
+                None => 0usize,
+            },
+        }
+    } else {
+        body.get("n").and_then(|v| v.as_u64()).unwrap_or(1) as usize
+    };
     if !image_generation_count_allowed_for_build(n) {
+        if cfg!(feature = "tinix-m0-hardened") {
+            let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+                model,
+                "",
+                "invalid_image_count",
+            );
+        }
         return Err((
             StatusCode::BAD_REQUEST,
-            "The native-image live-test build accepts exactly one image per request (n=1)."
+            "The hardened native-image build accepts exactly one image per request (n=1)."
                 .to_string(),
             None,
         ));
@@ -5199,11 +5379,37 @@ pub async fn handle_images_generations_internal(
         .get("response_format")
         .and_then(|v| v.as_str())
         .unwrap_or("b64_json");
+    if cfg!(feature = "tinix-m0-hardened") && response_format != "b64_json" {
+        let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+            model,
+            "",
+            "unsupported_response_format",
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Unsupported response_format '{}': Tinix M0 hardened proxy requires 'b64_json'.",
+                response_format
+            ),
+            None,
+        ));
+    }
 
     let quality = body.get("quality").and_then(|v| v.as_str());
 
-    let image_size = generation_image_size_param(&body)
-        .map_err(|message| (StatusCode::BAD_REQUEST, message, None))?;
+    let image_size = match generation_image_size_param(&body) {
+        Ok(val) => val,
+        Err(message) => {
+            if cfg!(feature = "tinix-m0-hardened") {
+                let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+                    model,
+                    "",
+                    "invalid_image_size_type",
+                );
+            }
+            return Err((StatusCode::BAD_REQUEST, message, None));
+        }
+    };
 
     let style = body
         .get("style")
@@ -5225,22 +5431,37 @@ pub async fn handle_images_generations_internal(
         "[Images] Received generation request"
     );
 
-    // 2. 使用 common_utils 解析图片配置（统一逻辑，支持动态计算宽高比和 quality 映射）
-    let (image_config, clean_model_name) =
+    // 2. 解析图片配置
+    let (image_config, clean_model_name) = if cfg!(feature = "tinix-m0-hardened") {
+        match resolve_tinix_m0_image_config(&body, size, image_size) {
+            Ok((cfg, _tier)) => (cfg, model.to_string()),
+            Err((reason_code, message)) => {
+                let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+                    model,
+                    image_size.unwrap_or(""),
+                    reason_code,
+                );
+                return Err((StatusCode::BAD_REQUEST, message, None));
+            }
+        }
+    } else {
         crate::proxy::mappers::common_utils::try_parse_image_config_with_params(
             model, size, quality, image_size,
         )
-        .map_err(|message| (StatusCode::BAD_REQUEST, message, None))?;
+        .map_err(|message| (StatusCode::BAD_REQUEST, message, None))?
+    };
 
-    // 3. Prompt Enhancement（保留原有逻辑）
+    // 3. Prompt Construction (Tinix M0 hardened: never modify user prompt)
     let mut final_prompt = prompt.to_string();
-    if quality == Some("hd") {
-        final_prompt.push_str(", (high quality, highly detailed, 4k resolution, hdr)");
-    }
-    match style {
-        "vivid" => final_prompt.push_str(", (vivid colors, dramatic lighting, rich details)"),
-        "natural" => final_prompt.push_str(", (natural lighting, realistic, photorealistic)"),
-        _ => {}
+    if !cfg!(feature = "tinix-m0-hardened") {
+        if quality == Some("hd") {
+            final_prompt.push_str(", (high quality, highly detailed, 4k resolution, hdr)");
+        }
+        match style {
+            "vivid" => final_prompt.push_str(", (vivid colors, dramatic lighting, rich details)"),
+            "natural" => final_prompt.push_str(", (natural lighting, realistic, photorealistic)"),
+            _ => {}
+        }
     }
     let contents_parts = build_image_contents(final_prompt, &input_images, None);
 
@@ -5252,7 +5473,7 @@ pub async fn handle_images_generations_internal(
     let request_timeout = state.request_timeout;
     let max_pool_size = token_manager.len();
     // [FIX #3485] 自适应多账号池与单账号退避最大重试次数 (单账号3次，多账号整池两轮)
-    // The dedicated live-test build never rotates accounts or retries an image request.
+    // The dedicated hardened build never rotates accounts or retries an image request.
     let max_attempts = image_generation_account_attempt_limit(max_pool_size);
 
     let mut tasks = JoinSet::new();
@@ -5331,6 +5552,29 @@ pub async fn handle_images_generations_internal(
                     *g = Some(email.clone());
                 }
 
+                let requested_image_size = image_config
+                    .get("imageSize")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                if cfg!(feature = "tinix-m0-hardened") {
+                    if !token_manager.account_lists_exact_model(&account_id, &model_to_use) {
+                        let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+                            &model_to_use,
+                            &requested_image_size,
+                            "account_missing_exact_model",
+                        );
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "MODEL_UNAVAILABLE_ON_ACCOUNT: selected account '{}' does not list exact model '{}'.",
+                                email, model_to_use
+                            ),
+                        ));
+                    }
+                }
+
                 // [FIX] Resolve to the account-specific dynamic image model, exactly like the
                 // chat (openai.rs:232) and gemini (gemini.rs:155) handlers do. Sending the static
                 // alias (e.g. "gemini-3-pro-image") made upstream return 404 "Requested entity was
@@ -5338,11 +5582,20 @@ pub async fn handle_images_generations_internal(
                 let resolved_model = token_manager
                     .resolve_dynamic_model_for_account(&account_id, &model_to_use)
                     .await;
-                let requested_image_size = image_config
-                    .get("imageSize")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
+                if cfg!(feature = "tinix-m0-hardened") && resolved_model != model_to_use {
+                    let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+                        &model_to_use,
+                        &requested_image_size,
+                        "dynamic_model_rewrite_forbidden",
+                    );
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "MODEL_REWRITE_FORBIDDEN: resolved model '{}' does not match requested model '{}'.",
+                            resolved_model, model_to_use
+                        ),
+                    ));
+                }
 
                 let gemini_body = json!({
                     "project": project_id,
@@ -5383,7 +5636,7 @@ pub async fn handle_images_generations_internal(
                         let response = call_result.response;
                         let status = response.status();
                         if !status.is_success() {
-                            if cfg!(feature = "native-image-live-test") {
+                            if crate::proxy::upstream::client::is_hardened_image_build() {
                                 return Err((
                                     status,
                                     format!("Upstream image request returned HTTP {}", status.as_u16()),
@@ -5395,13 +5648,13 @@ pub async fn handle_images_generations_internal(
                                 .get("Retry-After")
                                 .and_then(|header| header.to_str().ok())
                                 .map(str::to_string);
-                            let err_text = if cfg!(feature = "native-image-live-test") {
+                            let err_text = if crate::proxy::upstream::client::is_hardened_image_build() {
                                 String::new()
                             } else {
                                 response.text().await.unwrap_or_default()
                             };
                             let status_code = status.as_u16();
-                            last_error = if cfg!(feature = "native-image-live-test") {
+                            last_error = if crate::proxy::upstream::client::is_hardened_image_build() {
                                 format!("Upstream image request returned HTTP {}", status_code)
                             } else {
                                 format!("Upstream error {}: {}", status, err_text)
@@ -5544,7 +5797,7 @@ pub async fn handle_images_generations_internal(
                                         response_body_started.elapsed().as_millis(),
                                     );
                                 }
-                                let error = if cfg!(feature = "native-image-live-test") {
+                                let error = if crate::proxy::upstream::client::is_hardened_image_build() {
                                     "Upstream image response body could not be read or parsed".to_string()
                                 } else {
                                     format!("Parse error: {}", e)
@@ -5557,7 +5810,7 @@ pub async fn handle_images_generations_internal(
                         }
                     }
                     Err(e) => {
-                        if cfg!(feature = "native-image-live-test") {
+                        if crate::proxy::upstream::client::is_hardened_image_build() {
                             return Err((StatusCode::BAD_GATEWAY, e));
                         }
                         last_error = format!("Network error: {}", e);
@@ -5675,9 +5928,11 @@ pub async fn handle_images_generations_internal(
     });
 
     // [FIX] 图像生成成功后触发配额刷新 (Issue #1995)
-    tokio::spawn(async move {
-        let _ = account::refresh_all_quotas_logic().await;
-    });
+    if !crate::proxy::upstream::client::is_hardened_image_build() {
+        tokio::spawn(async move {
+            let _ = account::refresh_all_quotas_logic().await;
+        });
+    }
 
     let email_header = used_email.unwrap_or_default();
     Ok((email_header, openai_response))
@@ -5691,6 +5946,17 @@ pub async fn handle_images_edits(
     >,
     mut multipart: axum::extract::Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if cfg!(feature = "tinix-m0-hardened") {
+        let _ = crate::proxy::upstream::client::record_native_image_pre_send_rejection(
+            "",
+            "",
+            "image_edits_disabled_in_tinix_m0",
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Image edits endpoint is disabled in the Tinix M0 hardened proxy.".to_string(),
+        ));
+    }
     tracing::info!("[Images] Received edit request");
 
     let mut input_images: Vec<NormalizedInputImage> = Vec::new();
@@ -7706,9 +7972,16 @@ async fn try_compress_openai_with_summary(
     Ok(forked_request)
 }
 
-#[cfg(all(test, feature = "native-image-live-test"))]
+#[cfg(all(
+    test,
+    any(feature = "native-image-live-test", feature = "tinix-m0-hardened")
+))]
 mod native_image_live_test_count_tests {
-    use super::{image_generation_account_attempt_limit, image_generation_count_allowed_for_build};
+    use super::{
+        image_generation_account_attempt_limit, image_generation_count_allowed_for_build,
+        resolve_tinix_m0_image_config,
+    };
+    use serde_json::json;
 
     #[test]
     fn live_test_build_requires_exactly_one_image() {
@@ -7719,5 +7992,57 @@ mod native_image_live_test_count_tests {
         assert_eq!(image_generation_account_attempt_limit(0), 1);
         assert_eq!(image_generation_account_attempt_limit(1), 1);
         assert_eq!(image_generation_account_attempt_limit(20), 1);
+    }
+
+    #[test]
+    fn tinix_m0_image_config_supports_only_2k_4k_square_and_rejects_downgrade_or_conflict() {
+        let body_2k = json!({
+            "model": "gemini-3.1-flash-image",
+            "prompt": "test",
+            "size": "2048x2048",
+            "image_size": "2K",
+            "aspect_ratio": "1:1"
+        });
+        let (cfg_2k, tier_2k) =
+            resolve_tinix_m0_image_config(&body_2k, Some("2048x2048"), Some("2K")).unwrap();
+        assert_eq!(tier_2k, "2K");
+        assert_eq!(
+            cfg_2k,
+            json!({ "aspectRatio": "1:1", "imageSize": "2K" })
+        );
+
+        let body_4k = json!({
+            "model": "gemini-3.1-flash-image",
+            "prompt": "test",
+            "size": "4096x4096",
+            "image_size": "4K",
+            "aspect_ratio": "1:1"
+        });
+        let (cfg_4k, tier_4k) =
+            resolve_tinix_m0_image_config(&body_4k, Some("4096x4096"), Some("4K")).unwrap();
+        assert_eq!(tier_4k, "4K");
+        assert_eq!(
+            cfg_4k,
+            json!({ "aspectRatio": "1:1", "imageSize": "4K" })
+        );
+
+        let (reason_1k, _) =
+            resolve_tinix_m0_image_config(&body_2k, Some("2048x2048"), Some("1K")).unwrap_err();
+        assert_eq!(reason_1k, "unsupported_image_size");
+
+        let (reason_conflict, _) =
+            resolve_tinix_m0_image_config(&body_2k, Some("4096x4096"), Some("2K")).unwrap_err();
+        assert_eq!(reason_conflict, "conflicting_size_and_image_size");
+
+        let body_16_9 = json!({
+            "aspect_ratio": "16:9"
+        });
+        let (reason_ar, _) =
+            resolve_tinix_m0_image_config(&body_16_9, Some("2048x2048"), Some("2K")).unwrap_err();
+        assert_eq!(reason_ar, "unsupported_aspect_ratio");
+
+        let (reason_size, _) =
+            resolve_tinix_m0_image_config(&body_2k, Some("1792x1024"), Some("2K")).unwrap_err();
+        assert_eq!(reason_size, "unsupported_size_or_aspect_ratio");
     }
 }

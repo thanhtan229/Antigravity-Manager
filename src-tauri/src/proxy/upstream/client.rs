@@ -181,6 +181,72 @@ pub fn record_native_image_response_failure(
     )
 }
 
+pub fn record_native_image_pre_send_rejection(
+    model: &str,
+    image_size: &str,
+    reason: &str,
+) -> Result<String, String> {
+    let budget_db_path = crate::proxy::image_attempt_budget::current_profile_budget_path()
+        .map_err(|_| "native image profile unavailable".to_string())?;
+    record_native_image_pre_send_rejection_at(&budget_db_path, model, image_size, reason)
+}
+
+pub fn record_native_image_pre_send_rejection_at(
+    budget_db_path: &Path,
+    model: &str,
+    image_size: &str,
+    reason: &str,
+) -> Result<String, String> {
+    let context = NativeImageLogContext {
+        correlation_id: uuid::Uuid::new_v4().to_string(),
+        model: safe_log_model(model),
+        image_size: if matches!(image_size, "1K" | "2K" | "4K") {
+            image_size.to_string()
+        } else {
+            "unknown".to_string()
+        },
+    };
+    record_native_image_event_at(
+        budget_db_path,
+        &context,
+        "PRE_SEND_REJECTED",
+        None,
+        Some(400),
+        Some(0),
+        Some(reason),
+    )?;
+    Ok(context.correlation_id)
+}
+
+pub const fn is_hardened_image_build() -> bool {
+    cfg!(any(
+        feature = "native-image-live-test",
+        feature = "tinix-m0-hardened"
+    ))
+}
+
+/// Optional loopback-only mock upstream override for local/CI mock compatibility tests.
+/// Never accepts any non-loopback host.
+pub fn loopback_mock_upstream_override() -> Option<String> {
+    #[cfg(feature = "tinix-m0-hardened")]
+    {
+        let raw = std::env::var("TINIX_M0_MOCK_UPSTREAM_URL").ok()?;
+        let trimmed = raw.trim().trim_end_matches('/').to_string();
+        if trimmed.starts_with("http://127.0.0.1:") {
+            return Some(trimmed);
+        }
+        None
+    }
+    #[cfg(not(feature = "tinix-m0-hardened"))]
+    {
+        None
+    }
+}
+
+pub fn is_mock_upstream_override_active() -> bool {
+    loopback_mock_upstream_override().is_some()
+}
+
 /// 端点降级尝试的记录信息
 #[derive(Debug, Clone)]
 pub struct FallbackAttemptLog {
@@ -238,6 +304,15 @@ fn live_image_request_timeout() -> Duration {
     }
     #[cfg(not(test))]
     {
+        if is_mock_upstream_override_active() {
+            if let Ok(ms_raw) = std::env::var("TINIX_M0_MOCK_UPSTREAM_TIMEOUT_MS") {
+                if let Ok(ms) = ms_raw.trim().parse::<u64>() {
+                    if (50..=30_000).contains(&ms) {
+                        return Duration::from_millis(ms);
+                    }
+                }
+            }
+        }
         Duration::from_secs(LIVE_IMAGE_UPSTREAM_TIMEOUT_SECS)
     }
 }
@@ -310,7 +385,7 @@ pub struct UpstreamClient {
 }
 
 fn configured_http2_retry_count() -> usize {
-    if cfg!(feature = "native-image-live-test") {
+    if is_hardened_image_build() {
         0
     } else {
         2 // rquest's normal default, retained for the production build.
@@ -322,10 +397,10 @@ impl UpstreamClient {
         proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>,
         proxy_pool: Option<Arc<crate::proxy::proxy_pool::ProxyPoolManager>>,
     ) -> Self {
-        // The test binary owns the attempt boundary. Do not route through a
+        // The test/hardened binary owns the attempt boundary. Do not route through a
         // separately configured forwarding proxy that could retry POST requests
         // outside this process's durable counter.
-        let (proxy_config, proxy_pool) = if cfg!(feature = "native-image-live-test") {
+        let (proxy_config, proxy_pool) = if is_hardened_image_build() {
             (None, None)
         } else {
             (proxy_config, proxy_pool)
@@ -340,8 +415,8 @@ impl UpstreamClient {
                 match Self::build_client_internal(None) {
                     Ok(client) => client,
                     Err(err_without_proxy) => {
-                        if cfg!(feature = "native-image-live-test") {
-                            panic!("Safe live-test HTTP client unavailable; refusing an unbounded client: {err_without_proxy}");
+                        if is_hardened_image_build() {
+                            panic!("Safe hardened HTTP client unavailable; refusing an unbounded client: {err_without_proxy}");
                         }
                         tracing::error!(
                             error = %err_without_proxy,
@@ -421,10 +496,10 @@ impl UpstreamClient {
             .timeout(Duration::from_secs(600));
 
         // rquest otherwise permits hidden HTTP/2 retries (default: 2). The
-        // dedicated live-test binary disables them so one send() reservation
+        // dedicated hardened binary disables them so one send() reservation
         // cannot fan out into additional generateContent HTTP requests.
         let builder = builder.http2_max_retry_count(configured_http2_retry_count());
-        let builder = if cfg!(feature = "native-image-live-test") {
+        let builder = if is_hardened_image_build() {
             // Redirect following can issue a second HTTP request invisibly inside
             // one send(); keep redirects outside the image attempt boundary.
             builder
@@ -441,7 +516,7 @@ impl UpstreamClient {
     fn build_client_internal(
         proxy_config: Option<crate::proxy::config::UpstreamProxyConfig>,
     ) -> Result<Client, rquest::Error> {
-        let proxy_config = if cfg!(feature = "native-image-live-test") {
+        let proxy_config = if is_hardened_image_build() {
             None
         } else {
             proxy_config
@@ -595,6 +670,20 @@ impl UpstreamClient {
         extra_headers: std::collections::HashMap<String, String>,
         account_id: Option<&str>, // [NEW] Account ID
     ) -> Result<UpstreamCallResult, String> {
+        if let Some(mock_url) = loopback_mock_upstream_override() {
+            return self
+                .call_v1_internal_with_headers_on_endpoints(
+                    method,
+                    access_token,
+                    body,
+                    query_string,
+                    extra_headers,
+                    account_id,
+                    &[mock_url.as_str()],
+                    None,
+                )
+                .await;
+        }
         self.call_v1_internal_with_headers_on_endpoints(
             method,
             access_token,
@@ -619,7 +708,7 @@ impl UpstreamClient {
         endpoint_urls: &[&str],
         attempt_budget_path: Option<std::path::PathBuf>,
     ) -> Result<UpstreamCallResult, String> {
-        let is_live_test_image_generation = cfg!(feature = "native-image-live-test")
+        let is_live_test_image_generation = is_hardened_image_build()
             && method == "generateContent"
             && body.get("requestType").and_then(Value::as_str) == Some("image_gen");
         let image_log_context =
@@ -629,7 +718,7 @@ impl UpstreamClient {
             return Err("No upstream endpoint configured; image request refused".to_string());
         }
 
-        // The dedicated live-test build uses one endpoint only. It never falls back,
+        // The dedicated live-test/hardened build uses one endpoint only. It never falls back,
         // including for network errors, 404s, timeouts, or 5xx responses.
         let selected_endpoints: Vec<&str> = if is_live_test_image_generation {
             endpoint_urls.iter().take(1).copied().collect()
@@ -789,14 +878,24 @@ impl UpstreamClient {
                 // counts requests that later fail at the socket/HTTP layer and closes
                 // races between callers and attempts across process restarts.
                 if is_live_test_image_generation {
+                    let cid_for_reservation = image_log_context
+                        .as_ref()
+                        .map(|c| c.correlation_id.clone())
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                     let reservation = if let Some(path) = attempt_budget_path.clone() {
                         tokio::task::spawn_blocking(move || {
-                            crate::proxy::image_attempt_budget::reserve_attempt_at(&path)
+                            crate::proxy::image_attempt_budget::reserve_attempt_for_request_at(
+                                &path,
+                                Some(cid_for_reservation.as_str()),
+                            )
                         })
                         .await
                         .map_err(|error| format!("Image attempt budget worker failed: {error}"))?
                     } else {
-                        crate::proxy::image_attempt_budget::reserve_current_profile_attempt().await
+                        crate::proxy::image_attempt_budget::reserve_current_profile_attempt_for_request(
+                            cid_for_reservation,
+                        )
+                        .await
                     };
                     let attempt = reservation.map_err(|error| error.to_string())?;
                     let evidence_path = match attempt_budget_path.clone() {
@@ -1222,7 +1321,10 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "native-image-live-test"))]
+#[cfg(all(
+    test,
+    any(feature = "native-image-live-test", feature = "tinix-m0-hardened")
+))]
 mod native_image_live_test_mock_tests {
     use super::*;
     use axum::{routing::any, Router};
@@ -1630,6 +1732,7 @@ mod native_image_live_test_mock_tests {
         let _ = std::fs::remove_file(budget_path);
     }
 
+    #[cfg(not(feature = "tinix-m0-hardened"))]
     #[tokio::test]
     async fn repeated_requests_and_new_client_instances_share_the_five_attempt_cap() {
         let (mock_url, hits, server) = start_mock_upstream().await;
@@ -1678,6 +1781,7 @@ mod native_image_live_test_mock_tests {
         let _ = std::fs::remove_file(budget_path);
     }
 
+    #[cfg(not(feature = "tinix-m0-hardened"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_mock_requests_cannot_send_more_than_five_attempts() {
         let (mock_url, hits, server) = start_mock_upstream().await;
@@ -1725,6 +1829,83 @@ mod native_image_live_test_mock_tests {
 
         server.abort();
         let _ = std::fs::remove_file(budget_path);
+    }
+
+    #[cfg(feature = "tinix-m0-hardened")]
+    #[tokio::test]
+    async fn tinix_m0_hardened_never_retries_on_401_403_429_503_or_caps_at_five() {
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let (first_url, first_hits, first_server) =
+                start_mock_upstream_response(status, "mock error", Duration::ZERO).await;
+            let (fallback_url, fallback_hits, fallback_server) = start_mock_upstream().await;
+            let budget_path = fresh_budget_path();
+            let client = UpstreamClient::new(None, None);
+            let mut extra_headers = std::collections::HashMap::new();
+            extra_headers.insert(
+                "x-goog-user-project".to_string(),
+                "custom-project-id".to_string(),
+            );
+            let result = client
+                .call_v1_internal_with_headers_on_endpoints(
+                    "generateContent",
+                    "mock-only-token",
+                    image_generation_body(),
+                    None,
+                    extra_headers,
+                    None,
+                    &[&first_url, &fallback_url],
+                    Some(budget_path.clone()),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.response.status(), status);
+            assert!(result.fallback_attempts.is_empty());
+            assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+            assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                crate::proxy::image_attempt_budget::current_usage_at(&budget_path).unwrap(),
+                1
+            );
+
+            first_server.abort();
+            fallback_server.abort();
+            cleanup_budget_files(&budget_path);
+        }
+
+        // Verify that sequential requests beyond 5 are not blocked by a 5-attempt research cap,
+        // while each request still makes at most 1 upstream attempt.
+        let (mock_url, hits, server) = start_mock_upstream().await;
+        let budget_path = fresh_budget_path();
+        for i in 1..=8 {
+            let client = UpstreamClient::new(None, None);
+            let result = client
+                .call_v1_internal_with_headers_on_endpoints(
+                    "generateContent",
+                    "mock-only-token",
+                    image_generation_body(),
+                    None,
+                    Default::default(),
+                    None,
+                    &[&mock_url],
+                    Some(budget_path.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(hits.load(Ordering::SeqCst), i);
+        }
+        assert_eq!(
+            crate::proxy::image_attempt_budget::current_usage_at(&budget_path).unwrap(),
+            8
+        );
+        server.abort();
+        cleanup_budget_files(&budget_path);
     }
 
     #[tokio::test]

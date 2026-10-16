@@ -193,13 +193,19 @@ pub async fn internal_start_proxy_service(
     let active_accounts = token_manager.load_accounts().await.unwrap_or(0);
 
     if active_accounts == 0 {
-        tracing::warn!("沒有可用賬號，反代邏輯將暫停，請通過管理界面添加。");
-        return Ok(ProxyStatus {
-            running: false,
-            port: config.port,
-            base_url: format!("http://127.0.0.1:{}", config.port),
-            active_accounts: 0,
-        });
+        if cfg!(feature = "tinix-m0-hardened") {
+            tracing::info!(
+                "[Tinix-M0] Starting hardened proxy with 0 loaded accounts; /health and /v1/models are active, generation remains fail-closed."
+            );
+        } else {
+            tracing::warn!("沒有可用賬號，反代邏輯將暫停，請通過管理界面添加。");
+            return Ok(ProxyStatus {
+                running: false,
+                port: config.port,
+                base_url: format!("http://127.0.0.1:{}", config.port),
+                active_accounts: 0,
+            });
+        }
     }
 
     let mut instance_lock = state.instance.write().await;

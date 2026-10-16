@@ -276,15 +276,86 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+fn parse_cli_arg_value(args: &[String], flag: &str) -> Option<String> {
+    let prefix = format!("{}=", flag);
+    for (idx, arg) in args.iter().enumerate() {
+        if arg == flag {
+            if let Some(val) = args.get(idx + 1) {
+                if !val.trim().is_empty() {
+                    return Some(val.trim().to_string());
+                }
+            }
+        } else if let Some(val) = arg.strip_prefix(&prefix) {
+            if !val.trim().is_empty() {
+                return Some(val.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "tinix-m0-hardened")]
+fn verify_tinix_m0_profile_identity_at_startup() -> Result<std::path::PathBuf, String> {
+    let data_dir = modules::account::get_data_dir()?;
+    let identity_path = data_dir.join("tinix-profile-identity.json");
+    let raw = std::fs::read_to_string(&identity_path).map_err(|e| {
+        format!(
+            "TINIX_M0_PROFILE_IDENTITY_MISSING: '{}' could not be read ({}). Tinix M0 hardened proxy requires an explicit isolated profile marker.",
+            identity_path.display(),
+            e
+        )
+    })?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "TINIX_M0_PROFILE_IDENTITY_INVALID: '{}' is not valid JSON ({})",
+            identity_path.display(),
+            e
+        )
+    })?;
+    let isolated = parsed
+        .get("isolated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let is_research = parsed
+        .get("isResearchProfile")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let profile_id = parsed
+        .get("profileId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !isolated || is_research || profile_id.is_empty() {
+        return Err(format!(
+            "TINIX_M0_PROFILE_IDENTITY_REJECTED: '{}' must have isolated=true, isResearchProfile=false, and a non-empty profileId",
+            identity_path.display()
+        ));
+    }
+    Ok(data_dir)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Disable Windows background throttling/EcoQoS
     #[cfg(target_os = "windows")]
     windows_api::disable_efficiency_mode();
 
-    // Check for headless mode
+    // Check for CLI flags (--headless, --data-dir, --port)
     let args: Vec<String> = std::env::args().collect();
-    let is_headless = args.iter().any(|arg| arg == "--headless");
+    let is_headless = args.iter().any(|arg| arg == "--headless") || cfg!(feature = "tinix-m0-hardened");
+
+    if let Some(cli_data_dir) = parse_cli_arg_value(&args, "--data-dir") {
+        std::env::set_var("ABV_DATA_DIR", &cli_data_dir);
+    }
+    let cli_port = parse_cli_arg_value(&args, "--port")
+        .or_else(|| std::env::var("ABV_PORT").ok())
+        .and_then(|v| v.parse::<u16>().ok());
+
+    #[cfg(feature = "tinix-m0-hardened")]
+    if let Err(err) = verify_tinix_m0_profile_identity_at_startup() {
+        eprintln!("[FATAL] {}", err);
+        std::process::exit(1);
+    }
 
     // Increase file descriptor limit (macOS only)
     #[cfg(target_os = "macos")]
@@ -316,21 +387,6 @@ pub fn run() {
 
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
         rt.block_on(async {
-            // Initialize states manually
-            // [FIX] Initialize log bridge for headless mode
-            // Pass a dummy app handle or None since we don't have a Tauri app handle in headless mode
-            // Actually log_bridge relies on AppHandle to emit events.
-            // In headless mode, we don't emit events, but we still need the buffer.
-            // We need to modify log_bridge to handle missing AppHandle gracefully, which it already does (Option).
-            // But init_log_bridge requires AppHandle.
-            // We'll skip passing AppHandle for now and just leverage the global buffer capability.
-            // Since init_log_bridge takes AppHandle, we might need a separate init for headless or just not call init and rely on lazy init of buffer?
-            // Checking log_bridge code again...
-            // "static LOG_BUFFER: OnceLock<...> = OnceLock::new();" -> lazy init.
-            // So we just need to ensure the tracing layer is added.
-            // And `logger::init_logger()` adds the layer?
-            // Let's check `modules::logger`.
-
             let proxy_state = commands::proxy::ProxyServiceState::new();
             let cf_state = Arc::new(commands::cloudflared::CloudflaredState::new());
 
@@ -338,11 +394,26 @@ pub fn run() {
             match modules::config::load_app_config() {
                 Ok(mut config) => {
                     let mut modified = false;
+                    if let Some(port_override) = cli_port {
+                        if config.proxy.port != port_override {
+                            config.proxy.port = port_override;
+                            modified = true;
+                        }
+                    }
+
+                    if cfg!(feature = "tinix-m0-hardened") && config.proxy.port == 8045 {
+                        error!(
+                            "[FATAL] TINIX_M0_PORT_CONFLICT_FORBIDDEN: Port 8045 is reserved for the research proxy. Use a dedicated loopback port such as 8046."
+                        );
+                        std::process::exit(1);
+                    }
+
                     // Headless/docker 默认允许 LAN 访问（绑定 0.0.0.0）
-                    // 若设置 ABV_BIND_LOCAL_ONLY，则仅绑定 127.0.0.1
-                    let bind_local_only = std::env::var("ABV_BIND_LOCAL_ONLY")
-                        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-                        .unwrap_or(false);
+                    // 若设置 ABV_BIND_LOCAL_ONLY 或启用 tinix-m0-hardened，则仅绑定 127.0.0.1
+                    let bind_local_only = cfg!(feature = "tinix-m0-hardened")
+                        || std::env::var("ABV_BIND_LOCAL_ONLY")
+                            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                            .unwrap_or(false);
                     if bind_local_only {
                         config.proxy.allow_lan_access = false;
                         modified = true;
@@ -351,8 +422,13 @@ pub fn run() {
                     }
 
                     // [FIX] Force auth mode to AllExceptHealth in headless mode if it's Off or Auto
-                    // This ensures Web UI login validation works properly
-                    if matches!(config.proxy.auth_mode, crate::proxy::ProxyAuthMode::Off | crate::proxy::ProxyAuthMode::Auto) {
+                    // This ensures Web UI login validation works properly (unless tinix-m0-hardened explicitly configures Off)
+                    if !cfg!(feature = "tinix-m0-hardened")
+                        && matches!(
+                            config.proxy.auth_mode,
+                            crate::proxy::ProxyAuthMode::Off | crate::proxy::ProxyAuthMode::Auto
+                        )
+                    {
                         info!("Headless mode: Forcing auth_mode to AllExceptHealth for Web UI security");
                         config.proxy.auth_mode = crate::proxy::ProxyAuthMode::AllExceptHealth;
                         modified = true;
@@ -445,9 +521,13 @@ pub fn run() {
 
                     info!("Headless proxy service is running.");
 
-                    // Start smart scheduler for 7-day weekly reset warmup
-                    modules::scheduler::start_scheduler(None, proxy_state.clone());
-                    info!("Smart scheduler (7-Day Weekly Reset Warmup) started in headless mode.");
+                    // Start smart scheduler for 7-day weekly reset warmup (disabled in Tinix M0 hardened build)
+                    if !cfg!(feature = "tinix-m0-hardened") {
+                        modules::scheduler::start_scheduler(None, proxy_state.clone());
+                        info!("Smart scheduler (7-Day Weekly Reset Warmup) started in headless mode.");
+                    } else {
+                        info!("[Tinix-M0] Background warmup scheduler disabled by M0 policy.");
+                    }
                 }
                 Err(e) => {
                     error!("Failed to load config for headless mode: {}", e);

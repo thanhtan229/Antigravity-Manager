@@ -89,6 +89,7 @@ gtk = "0.18"
 [features]
 default = ["custom-protocol"]
 native-image-live-test = []
+tinix-m0-hardened = []
 custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
