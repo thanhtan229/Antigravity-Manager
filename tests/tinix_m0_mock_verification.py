@@ -88,6 +88,7 @@ def make_handler(mock_state: MockUpstreamState):
 
             if mode == "reset":
                 # Abruptly close socket without sending HTTP status line
+                self.close_connection = True
                 try:
                     self.connection.shutdown(socket.SHUT_RDWR)
                 except Exception:
@@ -116,13 +117,16 @@ def make_handler(mock_state: MockUpstreamState):
                         }
                     }
                 ).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(payload)
-                self.wfile.flush()
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                except OSError:
+                    pass
                 self.close_connection = True
                 return
 
@@ -136,15 +140,18 @@ def make_handler(mock_state: MockUpstreamState):
                     }
                 }
             ).encode("utf-8")
-            self.send_response(status_code)
-            if status_code == 429:
-                self.send_header("Retry-After", "1")
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(err_payload)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(err_payload)
-            self.wfile.flush()
+            try:
+                self.send_response(status_code)
+                if status_code == 429:
+                    self.send_header("Retry-After", "1")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(err_payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(err_payload)
+                self.wfile.flush()
+            except OSError:
+                pass
             self.close_connection = True
 
     return MockUpstreamHandler
@@ -648,7 +655,7 @@ def main():
             )
 
             # Scenario: Interrupted Client Request (client closes socket while upstream is in-flight)
-            mock_state.reset(mode="200", delay_sec=0.8)
+            mock_state.reset(mode="200", delay_sec=1.0)
             conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=5)
             body_interrupted = json.dumps(
                 {
@@ -666,9 +673,11 @@ def main():
                 body=body_interrupted,
                 headers={"Content-Type": "application/json"},
             )
-            time.sleep(0.25)
+            wait_in_flight_deadline = time.time() + 2.5
+            while time.time() < wait_in_flight_deadline and len(mock_state.get_calls()) == 0:
+                time.sleep(0.05)
             conn.close()
-            time.sleep(1.0)
+            time.sleep(1.2)
             calls_interrupted = mock_state.get_calls()
             assert len(calls_interrupted) == 1, f"Expected 1 upstream attempt on interrupted request, got {len(calls_interrupted)}"
             report["scenarios"].append(
