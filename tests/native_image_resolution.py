@@ -13,6 +13,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -99,57 +100,100 @@ def metadata_summary(data: bytes) -> dict[str, Any]:
     return summary
 
 
-def safe_json_error(body: bytes) -> str:
-    text = body.decode("utf-8", errors="replace")
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def append_event(path: Path, event: str, **fields: Any) -> None:
+    """Persist a small allowlisted status record; never include prompt, headers, or keys."""
+    allowed = {"label", "model", "image_size", "aspect_ratio", "http_status", "timeout_seconds", "error_type", "sha256", "interactive_tty", "confirmation_source"}
+    record = {"timestamp_utc": utc_now(), "event": event}
+    record.update({key: value for key, value in fields.items() if key in allowed})
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def ask_for_live_approval(confirmation: str | None, event_path: Path) -> bool:
+    interactive = sys.stdin.isatty()
+    append_event(event_path, "AWAITING_CONFIRMATION", interactive_tty=interactive)
+    print("AWAITING_CONFIRMATION: image requests have not started.", flush=True)
+    if confirmation == "GENERATE":
+        append_event(event_path, "CONFIRMED", confirmation_source="explicit_argument")
+        return True
+    if not interactive:
+        append_event(event_path, "CONFIRMATION_REQUIRED")
+        print("No interactive terminal. No request sent. Rerun with --confirmation GENERATE after approval.", flush=True)
+        return False
+    print('Type "GENERATE" to continue: ', end="", flush=True)
     try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            err = obj.get("error", obj)
-            if isinstance(err, dict):
-                return str(err.get("message", err.get("status", "HTTP error")))[:1200]
-    except json.JSONDecodeError:
-        pass
-    return text[:1200]
-
-
-def ask_for_live_approval() -> bool:
-    print("This will send two real image-generation calls through the configured local proxy.")
-    print("Google quota may be consumed. No retry is made by this script or by the isolated test proxy.")
-    return input('Type "GENERATE" to continue: ').strip() == "GENERATE"
+        accepted = input().strip() == "GENERATE"
+    except EOFError:
+        accepted = False
+    except KeyboardInterrupt:
+        append_event(event_path, "CONFIRMATION_INTERRUPTED", error_type="KeyboardInterrupt")
+        print("\nConfirmation interrupted; no request sent.", flush=True)
+        return False
+    append_event(event_path, "CONFIRMED" if accepted else "CONFIRMATION_DECLINED")
+    return accepted
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--confirm-live", action="store_true", help="also require interactive typing of GENERATE")
+    parser.add_argument("--confirmation", choices=["GENERATE"], help="explicit non-interactive approval; never read from a pipe")
     parser.add_argument("--base-url", default="http://127.0.0.1:8045/v1", help="must use loopback HTTP")
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--prompt", default=PROMPT)
     parser.add_argument("--api-key-env", default="AGM_API_KEY", help="environment variable name; value is never recorded")
     parser.add_argument("--max-requests", type=int, default=2, help="client-call ceiling (maximum 2 in this plan)")
     parser.add_argument("--output-dir", default="samples")
+    parser.add_argument("--timeout-seconds", type=float, default=600, help="socket inactivity timeout per request (default: 600)")
     args = parser.parse_args()
 
     if not args.confirm_live:
         parser.error("live generation is disabled unless --confirm-live is provided")
     if args.max_requests < 1 or args.max_requests > len(MATRIX):
         parser.error(f"--max-requests must be between 1 and {len(MATRIX)}")
-    if not args.base_url.startswith("http://127.0.0.1:"):
+    if args.timeout_seconds <= 0:
+        parser.error("--timeout-seconds must be greater than zero")
+    parsed_base_url = urlsplit(args.base_url)
+    if parsed_base_url.scheme != "http" or parsed_base_url.hostname != "127.0.0.1":
         parser.error("Only an http://127.0.0.1:<port> proxy URL is allowed")
     api_key = os.environ.get(args.api_key_env)
     if not api_key:
         parser.error(f"Set {args.api_key_env} to the local proxy API key; the value is not printed or written")
-    if not ask_for_live_approval():
-        print("Cancelled; no request sent.")
-        return 2
-
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    event_path = output_dir / "native_resolution_events.jsonl"
+    report_path = output_dir / "native_resolution_results.json"
+    reserved_output_paths = [event_path, report_path, report_path.with_suffix(".json.pending")]
+    for label, _size, _image_size in MATRIX[: args.max_requests]:
+        reserved_output_paths.extend(output_dir / f"{label}.{suffix}" for suffix in ("png", "jpg", "jpeg", "webp"))
+        reserved_output_paths.append(output_dir / f".{label}.response.pending")
+    collisions = [path.name for path in reserved_output_paths if path.exists()]
+    for label, _size, _image_size in MATRIX[: args.max_requests]:
+        collisions.extend(path.name for path in output_dir.glob(f".{label}.*.response.tmp"))
+        collisions.extend(path.name for path in output_dir.glob(f".{label}.*.image.pending"))
+    if collisions:
+        parser.error("Output artifacts already exist; select a fresh --output-dir")
+    if not ask_for_live_approval(args.confirmation, event_path):
+        print("Cancelled; no request sent.", flush=True)
+        return 2
+
     report: dict[str, Any] = {
-        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "started_at_utc": utc_now(),
         "requested_model_alias": args.model,
         "endpoint": args.base_url.rstrip("/") + "/images/generations",
         "prompt": args.prompt,
         "client_call_limit": args.max_requests,
+        "socket_inactivity_timeout_seconds": args.timeout_seconds,
         "client_calls": [],
         "actual_upstream_model_id": None,
         "actual_upstream_endpoint": None,
@@ -160,6 +204,7 @@ def main() -> int:
     }
     successes = 0
     calls = 0
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     for name, size, image_size in MATRIX[: args.max_requests]:
         payload = {
             "model": args.model,
@@ -174,7 +219,7 @@ def main() -> int:
             "requested_image_size": image_size,
             "requested_ratio": "1:1",
             "client_payload_redacted": payload,
-            "started_at_utc": datetime.now(timezone.utc).isoformat(),
+            "started_at_utc": utc_now(),
         }
         start = time.monotonic()
         calls += 1
@@ -184,10 +229,23 @@ def main() -> int:
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
             method="POST",
         )
+        pending_path = output_dir / f".{name}.response.pending"
+        response_tmp = output_dir / f".{name}.{os.getpid()}.response.tmp"
         try:
-            with urllib.request.urlopen(req, timeout=600) as response:
+            append_event(event_path, "SEND_STARTED", label=name, model=args.model, image_size=image_size,
+                         aspect_ratio="1:1", timeout_seconds=args.timeout_seconds)
+            print(f"SEND_STARTED: {name}; waiting for local proxy response; upstream progress is not observable here (socket inactivity timeout {args.timeout_seconds}s).", flush=True)
+            with opener.open(req, timeout=args.timeout_seconds) as response:
                 response_body = response.read()
                 entry["http_status"] = response.status
+            with response_tmp.open("xb") as stream:
+                stream.write(response_body)
+                stream.flush()
+                os.fsync(stream.fileno())
+            response_tmp.rename(pending_path)
+            append_event(event_path, "RESPONSE_RECEIVED", label=name, model=args.model, image_size=image_size,
+                         aspect_ratio="1:1", http_status=entry["http_status"])
+            print(f"RESPONSE_RECEIVED: {name}; HTTP {entry['http_status']}; raw response is durable before decoding.", flush=True)
             obj = json.loads(response_body)
             images = obj.get("data") if isinstance(obj, dict) else None
             if not isinstance(images, list) or not images:
@@ -198,7 +256,12 @@ def main() -> int:
             raw = base64.b64decode(b64, validate=True)
             fmt, width, height = image_dimensions(raw)
             sample_path = output_dir / f"{name}.{fmt.lower()}"
-            sample_path.write_bytes(raw)
+            sample_tmp = output_dir / f".{name}.{os.getpid()}.image.pending"
+            with sample_tmp.open("xb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            sample_tmp.rename(sample_path)
             entry.update({
                 "ok": True,
                 "format": fmt,
@@ -209,25 +272,56 @@ def main() -> int:
                 "metadata": metadata_summary(raw),
                 "sample": str(sample_path),
             })
+            pending_path.unlink()
+            append_event(event_path, "SAVED", label=name, model=args.model, image_size=image_size,
+                         aspect_ratio="1:1", sha256=entry["sha256"])
+            print(f"SAVED: {name}; {width}x{height} {fmt}; SHA-256 {entry['sha256']}.", flush=True)
             successes += 1
         except urllib.error.HTTPError as exc:
-            entry.update({"ok": False, "http_status": exc.code, "error": safe_json_error(exc.read())})
+            exc.close()
+            entry.update({"ok": False, "http_status": exc.code, "error": f"Local proxy returned HTTP {exc.code}; response body omitted."})
+            append_event(event_path, "RESPONSE_RECEIVED", label=name, model=args.model, image_size=image_size,
+                         aspect_ratio="1:1", http_status=exc.code)
+            print(f"RESPONSE_RECEIVED: {name}; HTTP {exc.code}; stopping without retry.", flush=True)
+        except KeyboardInterrupt:
+            entry.update({"ok": False, "error": "Interrupted by operator while awaiting response or processing it."})
+            append_event(event_path, "INTERRUPTED", label=name, model=args.model, image_size=image_size,
+                         aspect_ratio="1:1", error_type="KeyboardInterrupt")
+            print(f"INTERRUPTED: {name}; preserving any partial response or image files and stopping.", flush=True)
+            entry["latency_seconds"] = round(time.monotonic() - start, 3)
+            entry["finished_at_utc"] = utc_now()
+            report["client_calls"].append(entry)
+            break
+        except (TimeoutError, urllib.error.URLError) as exc:
+            reason = getattr(exc, "reason", exc)
+            entry.update({"ok": False, "error": f"{type(reason).__name__}: request wait failed or timed out"})
+            append_event(event_path, "INTERRUPTED", label=name, model=args.model, image_size=image_size,
+                         aspect_ratio="1:1", timeout_seconds=args.timeout_seconds, error_type=type(reason).__name__)
+            print(f"INTERRUPTED: {name}; {type(reason).__name__}; stopping without retry.", flush=True)
         except Exception as exc:
             entry.update({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
-        entry["latency_seconds"] = round(time.monotonic() - start, 3)
-        entry["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
-        report["client_calls"].append(entry)
-        print(json.dumps(entry, ensure_ascii=False, indent=2))
+            if pending_path.exists() or response_tmp.exists():
+                append_event(event_path, "PROCESSING_FAILED", label=name, model=args.model, image_size=image_size,
+                             aspect_ratio="1:1", error_type=type(exc).__name__)
+        if entry.get("finished_at_utc") is None:
+            entry["latency_seconds"] = round(time.monotonic() - start, 3)
+            entry["finished_at_utc"] = utc_now()
+            report["client_calls"].append(entry)
+        print(json.dumps(entry, ensure_ascii=False, indent=2), flush=True)
         if not entry.get("ok"):
             break
 
-    report["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+    report["finished_at_utc"] = utc_now()
     report["client_request_count"] = calls
     report["successful_client_requests"] = successes
     report["result"] = "COMPLETED" if successes == calls and calls == len(MATRIX[: args.max_requests]) else "FAILED_OR_INCOMPLETE"
-    report_path = output_dir / "native_resolution_results.json"
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"Saved redacted run metadata to {report_path}")
+    report_tmp = report_path.with_suffix(".json.pending")
+    with report_tmp.open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    report_tmp.rename(report_path)
+    print(f"Saved run metadata to {report_path}", flush=True)
     if calls > 2:
         print("Internal error: test plan call cap exceeded", file=sys.stderr)
         return 3

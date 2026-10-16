@@ -5338,6 +5338,11 @@ pub async fn handle_images_generations_internal(
                 let resolved_model = token_manager
                     .resolve_dynamic_model_for_account(&account_id, &model_to_use)
                     .await;
+                let requested_image_size = image_config
+                    .get("imageSize")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
 
                 let gemini_body = json!({
                     "project": project_id,
@@ -5374,18 +5379,33 @@ pub async fn handle_images_generations_internal(
                     .await
                 {
                     Ok(call_result) => {
+                        let image_correlation_id = call_result.image_correlation_id.clone();
                         let response = call_result.response;
                         let status = response.status();
                         if !status.is_success() {
+                            if cfg!(feature = "native-image-live-test") {
+                                return Err((
+                                    status,
+                                    format!("Upstream image request returned HTTP {}", status.as_u16()),
+                                ));
+                            }
                             failure_statuses.record(status);
                             let retry_after = response
                                 .headers()
                                 .get("Retry-After")
                                 .and_then(|header| header.to_str().ok())
                                 .map(str::to_string);
-                            let err_text = response.text().await.unwrap_or_default();
+                            let err_text = if cfg!(feature = "native-image-live-test") {
+                                String::new()
+                            } else {
+                                response.text().await.unwrap_or_default()
+                            };
                             let status_code = status.as_u16();
-                            last_error = format!("Upstream error {}: {}", status, err_text);
+                            last_error = if cfg!(feature = "native-image-live-test") {
+                                format!("Upstream image request returned HTTP {}", status_code)
+                            } else {
+                                format!("Upstream error {}: {}", status, err_text)
+                            };
                             let strategy = (status_code == 429).then(|| {
                                 retry_state.determine_strategy(
                                     &account_id,
@@ -5483,8 +5503,25 @@ pub async fn handle_images_generations_internal(
                             // Other errors: return
                             return Err((failure_statuses.final_status(), last_error));
                         }
+                        let response_body_started = std::time::Instant::now();
                         match response.json::<Value>().await {
                             Ok(json) => {
+                                if let Some(correlation_id) = image_correlation_id.as_deref() {
+                                    if crate::proxy::upstream::client::record_native_image_response_saved(
+                                        correlation_id,
+                                        &resolved_model,
+                                        &requested_image_size,
+                                    )
+                                    .is_err()
+                                    {
+                                        tracing::error!(
+                                            correlation_id = %correlation_id,
+                                            model = %resolved_model,
+                                            imageSize = %requested_image_size,
+                                            "native image response-saved event could not be persisted"
+                                        );
+                                    }
+                                }
                                 if response_has_inline_image_data(&json) {
                                     token_manager.commit_session(&affinity_key, &account_id);
                                     token_manager.mark_account_success(&account_id);
@@ -5497,14 +5534,32 @@ pub async fn handle_images_generations_internal(
                                 return Ok((json, email));
                             }
                             Err(e) => {
+                                if let Some(correlation_id) = image_correlation_id.as_deref() {
+                                    let timed_out = e.is_timeout();
+                                    let _ = crate::proxy::upstream::client::record_native_image_response_failure(
+                                        correlation_id,
+                                        &resolved_model,
+                                        &requested_image_size,
+                                        timed_out,
+                                        response_body_started.elapsed().as_millis(),
+                                    );
+                                }
+                                let error = if cfg!(feature = "native-image-live-test") {
+                                    "Upstream image response body could not be read or parsed".to_string()
+                                } else {
+                                    format!("Parse error: {}", e)
+                                };
                                 return Err((
                                     StatusCode::BAD_GATEWAY,
-                                    format!("Parse error: {}", e),
+                                    error,
                                 ))
                             }
                         }
                     }
                     Err(e) => {
+                        if cfg!(feature = "native-image-live-test") {
+                            return Err((StatusCode::BAD_GATEWAY, e));
+                        }
                         last_error = format!("Network error: {}", e);
                         failure_statuses.record(StatusCode::BAD_GATEWAY);
                         drop(image_permit.take());

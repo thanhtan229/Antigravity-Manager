@@ -5,8 +5,181 @@ use dashmap::DashMap;
 use rquest::{header, Client, Response, StatusCode};
 use serde_json::Value;
 use std::sync::Arc;
+use std::{fs::OpenOptions, io::Write, path::Path};
 use tokio::sync::RwLock;
 use tokio::time::Duration;
+
+/// The local test harness waits longer than the upstream request deadline so it
+/// can receive the proxy's timeout result. A client timeout still cannot prove
+/// that Google's service cancelled work already accepted upstream.
+pub const LIVE_IMAGE_UPSTREAM_TIMEOUT_SECS: u64 = 540;
+pub const LIVE_IMAGE_CLIENT_TIMEOUT_SECS: u64 = 600;
+
+#[derive(Clone, Debug)]
+struct NativeImageLogContext {
+    correlation_id: String,
+    model: String,
+    image_size: String,
+}
+
+fn safe_log_model(value: &str) -> String {
+    let safe: String = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || "-_.:".contains(*character))
+        .take(100)
+        .collect();
+    if safe.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
+    }
+}
+
+fn native_image_log_context(body: &Value) -> NativeImageLogContext {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(safe_log_model)
+        .unwrap_or_else(|| "unknown".to_string());
+    let image_size = body
+        .pointer("/request/generationConfig/imageConfig/imageSize")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "1K" | "2K" | "4K"))
+        .unwrap_or("unknown")
+        .to_string();
+    NativeImageLogContext {
+        correlation_id: uuid::Uuid::new_v4().to_string(),
+        model,
+        image_size,
+    }
+}
+
+fn native_image_event_path(budget_db_path: &Path, correlation_id: &str) -> std::path::PathBuf {
+    budget_db_path.with_extension(format!("events-{correlation_id}.jsonl"))
+}
+
+fn record_native_image_event_at(
+    budget_db_path: &Path,
+    context: &NativeImageLogContext,
+    event: &str,
+    attempt: Option<u64>,
+    http_status: Option<u16>,
+    elapsed_ms: Option<u128>,
+    error_kind: Option<&str>,
+) -> Result<(), String> {
+    let timestamp_utc = chrono::Utc::now().to_rfc3339();
+    let record = serde_json::json!({
+        "timestamp_utc": timestamp_utc,
+        "event": event,
+        "correlation_id": context.correlation_id,
+        "model": context.model,
+        "imageSize": context.image_size,
+        "attempt": attempt,
+        "http_status": http_status,
+        "elapsed_ms": elapsed_ms,
+        "error_kind": error_kind,
+    });
+    let path = native_image_event_path(budget_db_path, &context.correlation_id);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|_| "native image event log unavailable".to_string())?;
+    serde_json::to_writer(&mut file, &record)
+        .map_err(|_| "native image event log serialization failed".to_string())?;
+    file.write_all(b"\n")
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "native image event log write failed".to_string())?;
+
+    tracing::info!(
+        timestamp_utc = %timestamp_utc,
+        event = %event,
+        correlation_id = %context.correlation_id,
+        model = %context.model,
+        imageSize = %context.image_size,
+        attempt = ?attempt,
+        http_status = ?http_status,
+        elapsed_ms = ?elapsed_ms,
+        error_kind = ?error_kind,
+        "native image upstream state"
+    );
+    Ok(())
+}
+
+/// Mark that the image handler fully read and parsed the upstream JSON response.
+/// The response body itself is deliberately never persisted by this logger.
+pub fn record_native_image_response_saved(
+    correlation_id: &str,
+    model: &str,
+    image_size: &str,
+) -> Result<(), String> {
+    let budget_db_path = crate::proxy::image_attempt_budget::current_profile_budget_path()
+        .map_err(|_| "native image profile unavailable".to_string())?;
+    record_native_image_response_saved_at(&budget_db_path, correlation_id, model, image_size)
+}
+
+fn record_native_image_response_saved_at(
+    budget_db_path: &Path,
+    correlation_id: &str,
+    model: &str,
+    image_size: &str,
+) -> Result<(), String> {
+    let context = NativeImageLogContext {
+        correlation_id: correlation_id.to_string(),
+        model: safe_log_model(model),
+        image_size: if matches!(image_size, "1K" | "2K" | "4K") {
+            image_size.to_string()
+        } else {
+            "unknown".to_string()
+        },
+    };
+    record_native_image_event_at(
+        budget_db_path,
+        &context,
+        "RESPONSE_SAVED",
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+pub fn record_native_image_response_failure(
+    correlation_id: &str,
+    model: &str,
+    image_size: &str,
+    timed_out: bool,
+    elapsed_ms: u128,
+) -> Result<(), String> {
+    let budget_db_path = crate::proxy::image_attempt_budget::current_profile_budget_path()
+        .map_err(|_| "native image profile unavailable".to_string())?;
+    let context = NativeImageLogContext {
+        correlation_id: correlation_id.to_string(),
+        model: safe_log_model(model),
+        image_size: if matches!(image_size, "1K" | "2K" | "4K") {
+            image_size.to_string()
+        } else {
+            "unknown".to_string()
+        },
+    };
+    record_native_image_event_at(
+        &budget_db_path,
+        &context,
+        if timed_out {
+            "UPSTREAM_TIMEOUT"
+        } else {
+            "UPSTREAM_ERROR"
+        },
+        None,
+        None,
+        Some(elapsed_ms),
+        Some(if timed_out {
+            "timeout_reading_response"
+        } else {
+            "response_read"
+        }),
+    )
+}
 
 /// 端点降级尝试的记录信息
 #[derive(Debug, Clone)]
@@ -25,6 +198,48 @@ pub struct UpstreamCallResult {
     pub response: Response,
     /// 降级过程中失败的端点尝试记录 (成功时为空)
     pub fallback_attempts: Vec<FallbackAttemptLog>,
+    /// Random, non-secret correlation id used only by native image test logs.
+    pub image_correlation_id: Option<String>,
+}
+
+struct NativeImageSendGuard {
+    budget_db_path: std::path::PathBuf,
+    context: NativeImageLogContext,
+    attempt: u64,
+    finished: bool,
+}
+
+impl NativeImageSendGuard {
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for NativeImageSendGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = record_native_image_event_at(
+                &self.budget_db_path,
+                &self.context,
+                "UPSTREAM_INTERRUPTED",
+                Some(self.attempt),
+                None,
+                None,
+                Some("local_future_cancelled"),
+            );
+        }
+    }
+}
+
+fn live_image_request_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        Duration::from_millis(250)
+    }
+    #[cfg(not(test))]
+    {
+        Duration::from_secs(LIVE_IMAGE_UPSTREAM_TIMEOUT_SECS)
+    }
 }
 
 /// 邮箱脱敏：只显示前3位 + *** + @域名前2位 + ***
@@ -407,6 +622,8 @@ impl UpstreamClient {
         let is_live_test_image_generation = cfg!(feature = "native-image-live-test")
             && method == "generateContent"
             && body.get("requestType").and_then(Value::as_str) == Some("image_gen");
+        let image_log_context =
+            is_live_test_image_generation.then(|| native_image_log_context(&body));
 
         if is_live_test_image_generation && endpoint_urls.is_empty() {
             return Err("No upstream endpoint configured; image request refused".to_string());
@@ -515,8 +732,11 @@ impl UpstreamClient {
             );
         }
 
-        // [DEBUG] Log headers for verification
-        tracing::debug!(?headers, "Final Upstream Request Headers");
+        // Never emit header values: this map includes the OAuth Authorization value.
+        tracing::debug!(
+            header_count = headers.len(),
+            "Final upstream headers prepared"
+        );
 
         let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.try_with(|holder| {
             let pairs: Vec<(&str, &str)> = headers
@@ -558,6 +778,13 @@ impl UpstreamClient {
                     req_builder = req_builder.body(body_bytes.clone());
                 }
 
+                if is_live_test_image_generation {
+                    req_builder = req_builder.timeout(live_image_request_timeout());
+                }
+
+                let mut reserved_attempt = None;
+                let mut image_event_db_path = None;
+
                 // Persist a reservation before every actual send. This deliberately
                 // counts requests that later fail at the socket/HTTP layer and closes
                 // races between callers and attempts across process restarts.
@@ -584,13 +811,77 @@ impl UpstreamClient {
                         &body,
                     )
                     .map_err(|error| error.to_string())?;
+                    if let Some(context) = image_log_context.as_ref() {
+                        record_native_image_event_at(
+                            &evidence_path,
+                            context,
+                            "ATTEMPT_RESERVED",
+                            Some(attempt),
+                            None,
+                            None,
+                            None,
+                        )?;
+                    }
+                    reserved_attempt = Some(attempt);
+                    image_event_db_path = Some(evidence_path);
                 }
 
+                let send_started = std::time::Instant::now();
+                let mut send_guard = match (
+                    image_log_context.as_ref(),
+                    image_event_db_path.as_ref(),
+                    reserved_attempt,
+                ) {
+                    (Some(context), Some(path), Some(attempt)) => {
+                        record_native_image_event_at(
+                            path,
+                            context,
+                            "UPSTREAM_SEND_STARTED",
+                            Some(attempt),
+                            None,
+                            None,
+                            None,
+                        )?;
+                        Some(NativeImageSendGuard {
+                            budget_db_path: path.clone(),
+                            context: context.clone(),
+                            attempt,
+                            finished: false,
+                        })
+                    }
+                    _ => None,
+                };
                 let response = req_builder.send().await;
 
                 match response {
                     Ok(resp) => {
                         let status = resp.status();
+                        if let (Some(context), Some(path), Some(attempt)) = (
+                            image_log_context.as_ref(),
+                            image_event_db_path.as_ref(),
+                            reserved_attempt,
+                        ) {
+                            let log_result = record_native_image_event_at(
+                                path,
+                                context,
+                                "UPSTREAM_HTTP_RESPONSE",
+                                Some(attempt),
+                                Some(status.as_u16()),
+                                Some(send_started.elapsed().as_millis()),
+                                None,
+                            );
+                            if let Some(guard) = send_guard.as_mut() {
+                                guard.finish();
+                            }
+                            if log_result.is_err() {
+                                tracing::error!(
+                                    correlation_id = %context.correlation_id,
+                                    model = %context.model,
+                                    imageSize = %context.image_size,
+                                    "native image response event could not be persisted"
+                                );
+                            }
+                        }
                         if status.is_success() {
                             if idx > 0 {
                                 tracing::info!(
@@ -609,6 +900,9 @@ impl UpstreamClient {
                             return Ok(UpstreamCallResult {
                                 response: resp,
                                 fallback_attempts,
+                                image_correlation_id: image_log_context
+                                    .as_ref()
+                                    .map(|context| context.correlation_id.clone()),
                             });
                         }
 
@@ -618,6 +912,9 @@ impl UpstreamClient {
                             return Ok(UpstreamCallResult {
                                 response: resp,
                                 fallback_attempts,
+                                image_correlation_id: image_log_context
+                                    .as_ref()
+                                    .map(|context| context.correlation_id.clone()),
                             });
                         }
 
@@ -658,9 +955,51 @@ impl UpstreamClient {
                         return Ok(UpstreamCallResult {
                             response: resp,
                             fallback_attempts,
+                            image_correlation_id: image_log_context
+                                .as_ref()
+                                .map(|context| context.correlation_id.clone()),
                         });
                     }
                     Err(e) => {
+                        if let (Some(context), Some(path), Some(attempt)) = (
+                            image_log_context.as_ref(),
+                            image_event_db_path.as_ref(),
+                            reserved_attempt,
+                        ) {
+                            let timed_out = e.is_timeout();
+                            let log_result = record_native_image_event_at(
+                                path,
+                                context,
+                                if timed_out {
+                                    "UPSTREAM_TIMEOUT"
+                                } else {
+                                    "UPSTREAM_ERROR"
+                                },
+                                Some(attempt),
+                                None,
+                                Some(send_started.elapsed().as_millis()),
+                                Some(if timed_out { "timeout" } else { "transport" }),
+                            );
+                            if let Some(guard) = send_guard.as_mut() {
+                                guard.finish();
+                            }
+                            if log_result.is_err() {
+                                tracing::error!(
+                                    correlation_id = %context.correlation_id,
+                                    model = %context.model,
+                                    imageSize = %context.image_size,
+                                    "native image failure event could not be persisted"
+                                );
+                            }
+                            let kind = if timed_out {
+                                "timed out"
+                            } else {
+                                "failed at transport"
+                            };
+                            return Err(format!(
+                                "Native image upstream request {kind}; remote processing outcome is unknown"
+                            ));
+                        }
                         let msg = format!("HTTP request failed at {}: {}", base_url, e);
                         tracing::debug!("{}", msg);
                         if is_live_test_image_generation {
@@ -895,14 +1234,22 @@ mod native_image_live_test_mock_tests {
         assert_eq!(configured_http2_retry_count(), 0);
     }
 
-    async fn start_mock_upstream() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    async fn start_mock_upstream_response(
+        status: StatusCode,
+        body: &'static str,
+        delay: Duration,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let hits = Arc::new(AtomicUsize::new(0));
         let handler_hits = hits.clone();
         let app = Router::new().fallback(any(move || {
             let hits = handler_hits.clone();
+            let body = body.to_string();
             async move {
                 hits.fetch_add(1, Ordering::SeqCst);
-                (StatusCode::INTERNAL_SERVER_ERROR, "mock upstream failure")
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                (status, body)
             }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -917,12 +1264,25 @@ mod native_image_live_test_mock_tests {
         )
     }
 
+    async fn start_mock_upstream() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        start_mock_upstream_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "mock upstream failure",
+            Duration::ZERO,
+        )
+        .await
+    }
+
     fn image_generation_body() -> Value {
         serde_json::json!({
+            "model": "mock-image-model",
             "requestType": "image_gen",
             "request": {
-                "contents": [],
-                "generationConfig": {"candidateCount": 1}
+                "contents": [{"role": "user", "parts": [{"text": "DO_NOT_LOG_PROMPT"}]}],
+                "generationConfig": {
+                    "candidateCount": 1,
+                    "imageConfig": {"imageSize": "2K", "aspectRatio": "1:1"}
+                }
             }
         })
     }
@@ -932,6 +1292,127 @@ mod native_image_live_test_mock_tests {
             "native-image-mock-client-{}.sqlite3",
             uuid::Uuid::new_v4()
         ))
+    }
+
+    fn read_events(budget_path: &std::path::Path) -> (String, Vec<Value>) {
+        let stem = budget_path.file_stem().unwrap().to_string_lossy();
+        let prefix = format!("{stem}.events-");
+        let event_path = std::fs::read_dir(budget_path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .starts_with(&prefix)
+            })
+            .expect("expected native image event JSONL");
+        let text = std::fs::read_to_string(&event_path).unwrap();
+        let events = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (text, events)
+    }
+
+    fn cleanup_budget_files(budget_path: &std::path::Path) {
+        let stem = budget_path.file_stem().unwrap().to_string_lossy();
+        let prefix = format!("{stem}.events-");
+        let evidence_prefix = format!("{stem}.attempt-");
+        if let Ok(entries) = std::fs::read_dir(budget_path.parent().unwrap()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name.starts_with(&prefix) || name.starts_with(&evidence_prefix) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = budget_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+        }
+        let _ = std::fs::remove_file(budget_path);
+    }
+
+    #[tokio::test]
+    async fn successful_mock_logs_correlated_states_without_sensitive_payload() {
+        let (mock_url, hits, server) = start_mock_upstream_response(
+            StatusCode::OK,
+            r#"{"response":{"candidates":[],"test_b64":"MOCK_BASE64_MUST_NOT_APPEAR"}}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let budget_path = fresh_budget_path();
+        let client = UpstreamClient::new(None, None);
+        let result = client
+            .call_v1_internal_with_headers_on_endpoints(
+                "generateContent",
+                "mock-only-token",
+                image_generation_body(),
+                None,
+                Default::default(),
+                None,
+                &[&mock_url],
+                Some(budget_path.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.response.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let correlation_id = result.image_correlation_id.unwrap();
+        let _: Value = result.response.json().await.unwrap();
+        record_native_image_response_saved_at(
+            &budget_path,
+            &correlation_id,
+            "mock-image-model",
+            "2K",
+        )
+        .unwrap();
+        let (log_text, events) = read_events(&budget_path);
+        let event_names: Vec<&str> = events
+            .iter()
+            .map(|event| event["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            event_names,
+            [
+                "ATTEMPT_RESERVED",
+                "UPSTREAM_SEND_STARTED",
+                "UPSTREAM_HTTP_RESPONSE",
+                "RESPONSE_SAVED"
+            ]
+        );
+        for event in &events {
+            assert_eq!(event["correlation_id"], correlation_id);
+            assert_eq!(event["model"], "mock-image-model");
+            assert_eq!(event["imageSize"], "2K");
+            assert!(event["timestamp_utc"].as_str().is_some());
+        }
+        assert_eq!(events[2]["http_status"], 200);
+        assert!(events[2]["elapsed_ms"].as_u64().is_some());
+        for forbidden in [
+            "mock-only-token",
+            "DO_NOT_LOG_PROMPT",
+            "MOCK_BASE64_MUST_NOT_APPEAR",
+        ] {
+            assert!(!log_text.contains(forbidden));
+        }
+        assert_eq!(
+            crate::proxy::image_attempt_budget::current_usage_at(&budget_path).unwrap(),
+            1
+        );
+
+        server.abort();
+        cleanup_budget_files(&budget_path);
+    }
+
+    #[test]
+    fn client_wait_budget_exceeds_upstream_deadline() {
+        assert!(LIVE_IMAGE_CLIENT_TIMEOUT_SECS > LIVE_IMAGE_UPSTREAM_TIMEOUT_SECS);
     }
 
     #[tokio::test]
@@ -962,10 +1443,15 @@ mod native_image_live_test_mock_tests {
             crate::proxy::image_attempt_budget::current_usage_at(&budget_path).unwrap(),
             1
         );
+        let (log_text, events) = read_events(&budget_path);
+        assert_eq!(events[2]["event"], "UPSTREAM_HTTP_RESPONSE");
+        assert_eq!(events[2]["http_status"], 500);
+        assert!(!log_text.contains("mock-only-token"));
+        assert!(!log_text.contains("DO_NOT_LOG_PROMPT"));
 
         first_server.abort();
         fallback_server.abort();
-        let _ = std::fs::remove_file(budget_path);
+        cleanup_budget_files(&budget_path);
     }
 
     #[tokio::test]
@@ -993,9 +1479,101 @@ mod native_image_live_test_mock_tests {
             crate::proxy::image_attempt_budget::current_usage_at(&budget_path).unwrap(),
             1
         );
+        let (log_text, events) = read_events(&budget_path);
+        assert_eq!(events.last().unwrap()["event"], "UPSTREAM_ERROR");
+        assert!(!log_text.contains("mock-only-token"));
 
         fallback_server.abort();
-        let _ = std::fs::remove_file(budget_path);
+        cleanup_budget_files(&budget_path);
+    }
+
+    #[tokio::test]
+    async fn upstream_timeout_is_logged_and_does_not_fallback() {
+        let (first_url, first_hits, first_server) =
+            start_mock_upstream_response(StatusCode::OK, "mock response", Duration::from_secs(2))
+                .await;
+        let (fallback_url, fallback_hits, fallback_server) = start_mock_upstream().await;
+        let budget_path = fresh_budget_path();
+        let client = UpstreamClient::new(None, None);
+        let result = client
+            .call_v1_internal_with_headers_on_endpoints(
+                "generateContent",
+                "mock-only-token",
+                image_generation_body(),
+                None,
+                Default::default(),
+                None,
+                &[&first_url, &fallback_url],
+                Some(budget_path.clone()),
+            )
+            .await;
+
+        let error = result.err().unwrap();
+        assert!(error.contains("remote processing outcome is unknown"));
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+        let (_log_text, events) = read_events(&budget_path);
+        assert_eq!(events.last().unwrap()["event"], "UPSTREAM_TIMEOUT");
+        assert_eq!(events.last().unwrap()["error_kind"], "timeout");
+        assert!(events.last().unwrap()["elapsed_ms"].as_u64().is_some());
+        assert_eq!(
+            crate::proxy::image_attempt_budget::current_usage_at(&budget_path).unwrap(),
+            1
+        );
+
+        first_server.abort();
+        fallback_server.abort();
+        cleanup_budget_files(&budget_path);
+    }
+
+    #[tokio::test]
+    async fn cancelled_inflight_send_is_logged_without_claiming_remote_cancellation() {
+        let (mock_url, hits, server) =
+            start_mock_upstream_response(StatusCode::OK, "mock response", Duration::from_secs(5))
+                .await;
+        let budget_path = fresh_budget_path();
+        let client = Arc::new(UpstreamClient::new(None, None));
+        let task_client = client.clone();
+        let task_url = mock_url.clone();
+        let task_budget = budget_path.clone();
+        let task = tokio::spawn(async move {
+            task_client
+                .call_v1_internal_with_headers_on_endpoints(
+                    "generateContent",
+                    "mock-only-token",
+                    image_generation_body(),
+                    None,
+                    Default::default(),
+                    None,
+                    &[&task_url],
+                    Some(task_budget),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while hits.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+
+        let (log_text, events) = read_events(&budget_path);
+        assert_eq!(events.last().unwrap()["event"], "UPSTREAM_INTERRUPTED");
+        assert_eq!(
+            events.last().unwrap()["error_kind"],
+            "local_future_cancelled"
+        );
+        assert!(!log_text.contains("mock-only-token"));
+        assert_eq!(
+            crate::proxy::image_attempt_budget::current_usage_at(&budget_path).unwrap(),
+            1
+        );
+
+        server.abort();
+        cleanup_budget_files(&budget_path);
     }
 
     #[tokio::test]
